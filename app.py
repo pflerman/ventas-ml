@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Ventas PaliShopping - Lista ventas de MercadoLibre en vivo."""
+import io
 import json
 import os
 import sys
@@ -533,10 +534,31 @@ class VentasApp:
                     }
                 ]
             }
-        else:
-            body = {
-                "attributes": [{"id": "SELLER_SKU", "value_name": new_sku}]
-            }
+            return self._do_put(url, body)
+
+        # Item sin variación: intentar primero con attributes[SELLER_SKU].
+        # Si falla por item.pictures.max (validación full del item), caemos al
+        # campo legacy seller_custom_field, que es escalar y no dispara la
+        # validación completa.
+        try:
+            return self._do_put(
+                url, {"attributes": [{"id": "SELLER_SKU", "value_name": new_sku}]}
+            )
+        except HTTPError as e:
+            try:
+                body_text = e.read().decode("utf-8", errors="replace")
+            except Exception:
+                body_text = ""
+            if e.code == 400 and "item.pictures.max" in body_text:
+                # Fallback: campo legacy.
+                return self._do_put(url, {"seller_custom_field": new_sku})
+            # Re-raise con el body adjunto para que el handler lo muestre.
+            raise HTTPError(
+                e.url, e.code, e.reason, e.headers,
+                io.BytesIO(body_text.encode("utf-8")),
+            )
+
+    def _do_put(self, url: str, body: dict):
         data = json.dumps(body).encode("utf-8")
         req = Request(
             url,
