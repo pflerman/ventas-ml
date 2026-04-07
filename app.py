@@ -1119,8 +1119,10 @@ class VentasApp:
             chunk = unique_ids[i : i + BATCH]
             url = (
                 "https://api.mercadolibre.com/items?"
-                + urlencode({"ids": ",".join(chunk),
-                             "attributes": "id,seller_sku,attributes,variations"})
+                + urlencode({
+                    "ids": ",".join(chunk),
+                    "attributes": "id,seller_sku,seller_custom_field,attributes,variations",
+                })
             )
             try:
                 req = Request(
