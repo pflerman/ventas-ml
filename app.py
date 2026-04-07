@@ -5,6 +5,7 @@ import os
 import sys
 import threading
 import tkinter as tk
+import webbrowser
 from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, font as tkfont
@@ -185,6 +186,8 @@ class VentasApp:
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Button-3>", self._on_right_click)
         self.tree.bind("<Double-Button-1>", self._on_double_click)
+        self.tree.bind("<Control-Button-1>", self._on_ctrl_click)
+        self.tree.bind("<Shift-Button-1>", self._on_shift_click)
 
         self.context_menu = tk.Menu(self.tree, tearoff=0)
         self.context_menu.add_command(
@@ -353,6 +356,35 @@ class VentasApp:
         self.context_menu.entryconfig("Refrescar fila", state=leaf_state)
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.focus_set()
+
+    def _on_ctrl_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row or self.tree.parent(row) == "":
+            return "break"
+        info = self.leaf_to_item.get(row)
+        item_id = (info or {}).get("item_id")
+        if not item_id:
+            return "break"
+        # MLA1234567890 -> articulo.mercadolibre.com.ar/MLA-1234567890 (redirige al canónico)
+        if len(item_id) > 3 and item_id[:3].isalpha():
+            url = f"https://articulo.mercadolibre.com.ar/{item_id[:3]}-{item_id[3:]}"
+        else:
+            url = f"https://articulo.mercadolibre.com.ar/{item_id}"
+        webbrowser.open(url)
+        self._flash_status(f"Abriendo publicación {item_id}")
+        return "break"
+
+    def _on_shift_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row or self.tree.parent(row) == "":
+            return "break"
+        order_id = self.row_to_order.get(row)
+        if not order_id:
+            return "break"
+        url = f"https://www.mercadolibre.com.ar/ventas/{order_id}/detalle"
+        webbrowser.open(url)
+        self._flash_status(f"Abriendo venta {order_id}")
+        return "break"
 
     def _on_double_click(self, event):
         row = self.tree.identify_row(event.y)
@@ -764,6 +796,9 @@ class VentasApp:
         self.root.after(ms, lambda: self.status_var.set(prev) if self.status_var.get() == msg else None)
 
     def _on_click(self, event):
+        # Si vienen modificadores Ctrl/Shift, los manejan los otros bindings.
+        if event.state & 0x0004 or event.state & 0x0001:
+            return
         # Cerrar el menú contextual si quedó abierto.
         try:
             self.context_menu.unpost()
