@@ -165,7 +165,7 @@ class VentasApp:
         tree_frame = ttk.Frame(container)
         tree_frame.pack(fill="both", expand=True)
 
-        columns = ("check", "fecha", "sku", "cant", "producto", "precio")
+        columns = ("check", "fecha", "sku", "cant", "producto", "precio", "subtotal")
         self.tree = ttk.Treeview(
             tree_frame,
             columns=columns,
@@ -178,14 +178,16 @@ class VentasApp:
         self.tree.heading("sku", text="SKU")
         self.tree.heading("cant", text="Cant")
         self.tree.heading("producto", text="Producto")
-        self.tree.heading("precio", text="Precio")
+        self.tree.heading("precio", text="Precio U.")
+        self.tree.heading("subtotal", text="Subtotal")
         self.tree.column("#0", width=200, anchor="w", stretch=False)
         self.tree.column("check", width=40, anchor="center", stretch=False)
         self.tree.column("fecha", width=60, anchor="w", stretch=False)
         self.tree.column("sku", width=90, anchor="w", stretch=False)
         self.tree.column("cant", width=50, anchor="center", stretch=False)
-        self.tree.column("producto", width=340, anchor="w")
+        self.tree.column("producto", width=280, anchor="w")
         self.tree.column("precio", width=110, anchor="e", stretch=False)
+        self.tree.column("subtotal", width=110, anchor="e", stretch=False)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Button-3>", self._on_right_click)
         self.tree.bind("<Double-Button-1>", self._on_double_click)
@@ -830,13 +832,14 @@ class VentasApp:
                 if order_id not in self.selected_ids:
                     continue
                 values = self.tree.item(leaf_id, "values")
-                _, time_str, sku, qty, title, price_str = values
+                _, time_str, sku, qty, title, price_str, subtotal_str = values
                 info = self.leaf_to_item.get(leaf_id) or {}
                 quantity = int(info.get("quantity") or qty or 1)
+                unit_price = float(info.get("unit_price") or 0.0)
                 line_total = float(info.get("line_total") or 0.0)
                 grand_total += line_total
                 days.setdefault(day_key, []).append(
-                    (time_str, sku, quantity, title, price_str, line_total)
+                    (time_str, sku, quantity, title, unit_price, line_total)
                 )
 
         def _key(d):
@@ -861,10 +864,13 @@ class VentasApp:
         lines = [f"*Ventas seleccionadas* ({total_count})", ""]
         for d in ordered:
             lines.append(f"📅 *{d}*")
-            for time_str, sku, quantity, title, price_str, _ in days[d]:
+            for time_str, sku, quantity, title, unit_price, line_total in days[d]:
                 sku_part = f" [{sku}]" if sku else ""
-                qty_part = f" x{quantity}" if quantity and quantity != 1 else ""
-                lines.append(f"• {time_str} — {title}{sku_part}{qty_part} — {price_str}")
+                if quantity and quantity != 1:
+                    price_part = f"{quantity} x {format_price(unit_price)} = {format_price(line_total)}"
+                else:
+                    price_part = format_price(unit_price)
+                lines.append(f"• {time_str} — {title}{sku_part} — {price_part}")
             lines.append("")
         lines.append(f"*Total: {format_price(grand_total)}*")
         text = "\n".join(lines)
@@ -917,7 +923,7 @@ class VentasApp:
         left = Alignment(horizontal="left", vertical="center", wrap_text=True, indent=1)
         right = Alignment(horizontal="right", vertical="center", indent=1)
 
-        headers = ["Fecha", "Hora", "SKU", "Cant", "Producto", "Precio", "Notas"]
+        headers = ["Fecha", "Hora", "SKU", "Cant", "Producto", "Precio U.", "Subtotal", "Notas"]
         ws.append(headers)
         for col_idx, _ in enumerate(headers, start=1):
             cell = ws.cell(row=1, column=col_idx)
@@ -929,16 +935,19 @@ class VentasApp:
         ncols = len(headers)
         row_idx = 2
         for d in ordered:
-            for time_str, sku, quantity, title, price_str, line_total in days[d]:
+            for time_str, sku, quantity, title, unit_price, line_total in days[d]:
                 ws.cell(row=row_idx, column=1, value=d).alignment = center
                 ws.cell(row=row_idx, column=2, value=time_str).alignment = center
                 ws.cell(row=row_idx, column=3, value=sku).alignment = center
                 ws.cell(row=row_idx, column=4, value=quantity).alignment = center
                 ws.cell(row=row_idx, column=5, value=title).alignment = left
-                price_cell = ws.cell(row=row_idx, column=6, value=line_total)
+                price_cell = ws.cell(row=row_idx, column=6, value=unit_price)
                 price_cell.number_format = '"$"#,##0.00'
                 price_cell.alignment = right
-                ws.cell(row=row_idx, column=7, value="")  # campo notas vacío
+                subtotal_cell = ws.cell(row=row_idx, column=7, value=line_total)
+                subtotal_cell.number_format = '"$"#,##0.00'
+                subtotal_cell.alignment = right
+                ws.cell(row=row_idx, column=8, value="")  # campo notas vacío
                 for c in range(1, ncols + 1):
                     cell = ws.cell(row=row_idx, column=c)
                     cell.border = border
@@ -948,20 +957,20 @@ class VentasApp:
 
         # Fila de total
         ws.cell(row=row_idx, column=1, value="TOTAL").font = bold
-        ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=5)
+        ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=6)
         merged = ws.cell(row=row_idx, column=1)
         merged.alignment = right
-        total_cell = ws.cell(row=row_idx, column=6, value=grand_total)
+        total_cell = ws.cell(row=row_idx, column=7, value=grand_total)
         total_cell.font = bold
         total_cell.number_format = '"$"#,##0.00'
         total_cell.alignment = right
-        ws.cell(row=row_idx, column=7, value="")
+        ws.cell(row=row_idx, column=8, value="")
         for c in range(1, ncols + 1):
             ws.cell(row=row_idx, column=c).border = border
             ws.cell(row=row_idx, column=c).fill = day_fill
 
         # Anchos de columna (más amplios para fuente más grande + padding)
-        widths = {1: 16, 2: 11, 3: 18, 4: 9, 5: 60, 6: 18, 7: 38}
+        widths = {1: 16, 2: 11, 3: 18, 4: 9, 5: 55, 6: 16, 7: 18, 8: 32}
         for col, w in widths.items():
             ws.column_dimensions[get_column_letter(col)].width = w
 
@@ -1110,6 +1119,7 @@ class VentasApp:
                 unit_price_num = 0.0
             line_total = unit_price_num * quantity
             price_str = format_price(unit_price)
+            subtotal_str = format_price(line_total)
             dt = parse_iso(order.get("date_created", ""))
             day_key = format_day(dt)
             time_str = format_time(dt)
@@ -1122,7 +1132,7 @@ class VentasApp:
             leaf_id = self.tree.insert(
                 parent_id,
                 "end",
-                values=(mark, time_str, sku, quantity, title, price_str),
+                values=(mark, time_str, sku, quantity, title, price_str, subtotal_str),
                 tags=tags,
             )
             self.row_to_order[leaf_id] = order_id
