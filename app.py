@@ -128,6 +128,7 @@ class VentasApp:
         self.selected_ids: set = load_selections()
         self.row_to_order: dict = {}  # tree item id -> order_id (solo hojas)
         self.row_base: dict = {}  # tree item id -> "odd"/"even"
+        self.leaf_to_item: dict = {}  # tree leaf id -> {item_id, variation_id, sku, title}
         self.day_nodes: dict = {}  # "DD/MM/YYYY" -> parent row id
         self.day_count: dict = {}  # "DD/MM/YYYY" -> int
         self.day_total: dict = {}  # "DD/MM/YYYY" -> float
@@ -183,6 +184,7 @@ class VentasApp:
         self.tree.column("precio", width=110, anchor="e", stretch=False)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Button-3>", self._on_right_click)
+        self.tree.bind("<Double-Button-1>", self._on_double_click)
 
         self.context_menu = tk.Menu(self.tree, tearoff=0)
         self.context_menu.add_command(
@@ -346,6 +348,151 @@ class VentasApp:
         )
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.focus_set()
+
+    def _on_double_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row or self.tree.parent(row) == "":
+            return
+        info = self.leaf_to_item.get(row)
+        if not info or not info.get("item_id"):
+            return
+        self._open_sku_modal(row, info)
+
+    def _open_sku_modal(self, leaf_id: str, info: dict):
+        win = tk.Toplevel(self.root)
+        win.title("Editar SKU")
+        win.transient(self.root)
+        win.resizable(False, False)
+        win.grab_set()
+
+        frame = ttk.Frame(win, padding=15)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text=info.get("title", ""),
+            wraplength=420,
+            font=("TkDefaultFont", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+
+        meta = info.get("item_id", "")
+        if info.get("variation_id"):
+            meta += f"  ·  variación {info['variation_id']}"
+        ttk.Label(frame, text=meta, foreground="#666").pack(anchor="w", pady=(0, 12))
+
+        ttk.Label(frame, text="SKU:").pack(anchor="w")
+        sku_var = tk.StringVar(value=info.get("sku") or "")
+        entry = ttk.Entry(frame, textvariable=sku_var, width=42)
+        entry.pack(fill="x", pady=(2, 12))
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+
+        save_btn = ttk.Button(btns, text="Guardar")
+        cancel_btn = ttk.Button(btns, text="Cancelar", command=win.destroy)
+        save_btn.pack(side="right")
+        cancel_btn.pack(side="right", padx=(0, 6))
+
+        def do_save():
+            new_sku = sku_var.get().strip()
+            if new_sku == (info.get("sku") or ""):
+                win.destroy()
+                return
+            save_btn.configure(state="disabled", text="Guardando...")
+            cancel_btn.configure(state="disabled")
+            entry.configure(state="disabled")
+
+            def worker():
+                try:
+                    self._put_item_sku(
+                        info["item_id"], info.get("variation_id"), new_sku
+                    )
+                except HTTPError as e:
+                    body = ""
+                    try:
+                        body = e.read().decode("utf-8", errors="replace")[:300]
+                    except Exception:
+                        pass
+                    self.root.after(
+                        0,
+                        lambda: self._sku_save_failed(
+                            win, save_btn, cancel_btn, entry,
+                            f"HTTP {e.code}: {e.reason}\n{body}",
+                        ),
+                    )
+                    return
+                except Exception as e:
+                    self.root.after(
+                        0,
+                        lambda: self._sku_save_failed(
+                            win, save_btn, cancel_btn, entry, str(e)
+                        ),
+                    )
+                    return
+                self.root.after(
+                    0, lambda: self._on_sku_updated(leaf_id, info, new_sku, win)
+                )
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        save_btn.configure(command=do_save)
+        entry.bind("<Return>", lambda e: do_save())
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        # Centrar sobre la ventana principal.
+        win.update_idletasks()
+        x = self.root.winfo_x() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
+        win.geometry(f"+{x}+{y}")
+
+    def _sku_save_failed(self, win, save_btn, cancel_btn, entry, msg: str):
+        save_btn.configure(state="normal", text="Guardar")
+        cancel_btn.configure(state="normal")
+        entry.configure(state="normal")
+        messagebox.showerror("Error", f"No se pudo actualizar SKU:\n{msg}", parent=win)
+
+    def _on_sku_updated(self, leaf_id: str, info: dict, new_sku: str, win):
+        info["sku"] = new_sku
+        if leaf_id in self.tree.get_children(self.tree.parent(leaf_id)):
+            values = list(self.tree.item(leaf_id, "values"))
+            # values = (check, time, sku, title, price)
+            values[2] = new_sku
+            self.tree.item(leaf_id, values=values)
+        win.destroy()
+        self._flash_status(f"SKU actualizado: {new_sku}")
+
+    def _put_item_sku(self, item_id: str, variation_id, new_sku: str):
+        url = f"https://api.mercadolibre.com/items/{item_id}"
+        if variation_id:
+            body = {
+                "variations": [
+                    {
+                        "id": int(variation_id),
+                        "attributes": [
+                            {"id": "SELLER_SKU", "value_name": new_sku}
+                        ],
+                    }
+                ]
+            }
+        else:
+            body = {
+                "attributes": [{"id": "SELLER_SKU", "value_name": new_sku}]
+            }
+        data = json.dumps(body).encode("utf-8")
+        req = Request(
+            url,
+            data=data,
+            method="PUT",
+            headers={
+                "Authorization": f"Bearer {self.auth.access_token}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
+        with urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
 
     def _copy_clicked_title(self):
         row = self._right_clicked_row
@@ -552,6 +699,7 @@ class VentasApp:
         self.tree.delete(*self.tree.get_children())
         self.row_to_order.clear()
         self.row_base.clear()
+        self.leaf_to_item.clear()
         self.day_nodes.clear()
         self.day_count.clear()
         self.day_total.clear()
@@ -629,6 +777,12 @@ class VentasApp:
             )
             self.row_to_order[leaf_id] = order_id
             self.row_base[leaf_id] = base
+            self.leaf_to_item[leaf_id] = {
+                "item_id": item.get("id", ""),
+                "variation_id": item.get("variation_id"),
+                "sku": sku,
+                "title": title,
+            }
 
             self.day_count[day_key] = self.day_count.get(day_key, 0) + 1
             try:
