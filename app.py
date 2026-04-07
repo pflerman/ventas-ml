@@ -189,6 +189,17 @@ class VentasApp:
         self.tree.bind("<Control-Button-1>", self._on_ctrl_click)
         self.tree.bind("<Shift-Button-1>", self._on_shift_click)
 
+        self._hint_active = None  # "ctrl" / "shift" / None
+        self._status_before_hint = ""
+        self.root.bind("<KeyPress-Control_L>", lambda e: self._show_hint("ctrl"))
+        self.root.bind("<KeyPress-Control_R>", lambda e: self._show_hint("ctrl"))
+        self.root.bind("<KeyRelease-Control_L>", lambda e: self._hide_hint("ctrl"))
+        self.root.bind("<KeyRelease-Control_R>", lambda e: self._hide_hint("ctrl"))
+        self.root.bind("<KeyPress-Shift_L>", lambda e: self._show_hint("shift"))
+        self.root.bind("<KeyPress-Shift_R>", lambda e: self._show_hint("shift"))
+        self.root.bind("<KeyRelease-Shift_L>", lambda e: self._hide_hint("shift"))
+        self.root.bind("<KeyRelease-Shift_R>", lambda e: self._hide_hint("shift"))
+
         self.context_menu = tk.Menu(self.tree, tearoff=0)
         self.context_menu.add_command(
             label="Copiar título", command=self._copy_clicked_title
@@ -789,6 +800,27 @@ class VentasApp:
             return
 
         self._flash_status(f"Exportado: {os.path.basename(path)} ({count} ventas)")
+
+    def _show_hint(self, modifier: str):
+        if self._hint_active == modifier:
+            return  # auto-repeat de KeyPress, ignorar
+        if self._hint_active is None:
+            self._status_before_hint = self.status_var.get()
+        self._hint_active = modifier
+        if modifier == "ctrl":
+            self.status_var.set("⌨ Ctrl + click → abrir publicación en el browser")
+        else:
+            self.status_var.set("⌨ Shift + click → abrir detalle de la venta")
+
+    def _hide_hint(self, modifier: str):
+        if self._hint_active != modifier:
+            return
+        self._hint_active = None
+        # Restaurar el status previo (o recalcular si era de selección).
+        if self._status_before_hint:
+            self.status_var.set(self._status_before_hint)
+        else:
+            self._update_status()
 
     def _flash_status(self, msg: str, ms: int = 2500):
         prev = self.status_var.get()
