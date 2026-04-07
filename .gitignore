@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+seleccionadas.json
+*.xlsx
+.venv/
+venv/
