@@ -192,6 +192,7 @@ class VentasApp:
         self.context_menu.add_command(
             label="Copiar título", command=self._copy_clicked_title
         )
+        self.context_menu.bind("<FocusOut>", lambda e: self.context_menu.unpost())
         self._right_clicked_row = None
 
         self.tree.tag_configure("odd", background="#f5f5f5")
@@ -343,10 +344,8 @@ class VentasApp:
         self.context_menu.entryconfig(
             "Copiar título", state="normal" if is_leaf else "disabled"
         )
-        try:
-            self.context_menu.tk_popup(event.x_root, event.y_root)
-        finally:
-            self.context_menu.grab_release()
+        self.context_menu.tk_popup(event.x_root, event.y_root)
+        self.context_menu.focus_set()
 
     def _copy_clicked_title(self):
         row = self._right_clicked_row
@@ -529,6 +528,11 @@ class VentasApp:
         self.root.after(ms, lambda: self.status_var.set(prev) if self.status_var.get() == msg else None)
 
     def _on_click(self, event):
+        # Cerrar el menú contextual si quedó abierto.
+        try:
+            self.context_menu.unpost()
+        except tk.TclError:
+            pass
         region = self.tree.identify("region", event.x, event.y)
         if region != "cell":
             return
