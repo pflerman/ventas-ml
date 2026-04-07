@@ -715,12 +715,37 @@ class VentasApp:
                 return
 
             new_sku = self._extract_sku_from_item(data, variation_id)
+            print(
+                f"\n[REFRESH FILA] item={item_id} variation={variation_id}",
+                flush=True,
+            )
+            print(
+                f"  item.seller_custom_field = {data.get('seller_custom_field')!r}",
+                flush=True,
+            )
+            print(
+                f"  item.seller_sku = {data.get('seller_sku')!r}",
+                flush=True,
+            )
+            attr_sku = next(
+                (
+                    a.get("value_name")
+                    for a in data.get("attributes") or []
+                    if (a.get("id") or "").upper() == "SELLER_SKU"
+                ),
+                None,
+            )
+            print(f"  item.attributes[SELLER_SKU] = {attr_sku!r}", flush=True)
+            print(f"  has variations = {bool(data.get('variations'))}", flush=True)
+            print(f"  → extract returned: {new_sku!r}", flush=True)
             self.root.after(0, lambda: self._on_leaf_refreshed(leaf_id, new_sku))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _extract_sku_from_item(self, item_data: dict, variation_id) -> str:
-        # Variación con sus propios atributos: ese es el SKU canónico.
+        has_variations = bool(item_data.get("variations"))
+
+        # 1) Variación con sus propios atributos: ese es el SKU canónico.
         if variation_id:
             try:
                 vid = int(variation_id)
@@ -737,16 +762,31 @@ class VentasApp:
                     if sku:
                         return str(sku)
                     break
-        # Fallback al item-level: priorizamos seller_custom_field porque es
-        # nuestro target de escritura cuando el item tiene fotos en exceso.
-        sku = item_data.get("seller_custom_field")
-        if sku:
-            return str(sku)
-        for attr in item_data.get("attributes") or []:
-            if (attr.get("id") or "").upper() == "SELLER_SKU":
-                val = attr.get("value_name")
-                if val:
-                    return str(val)
+
+        # 2) Item-level. La prioridad depende de si el item tiene variaciones:
+        #    - Items con variaciones: ML solo deja escribir seller_custom_field,
+        #      así que ese es el campo "vivo". El attribute puede quedar viejo.
+        #    - Items planos: ML usa attributes[SELLER_SKU] como canónico, y
+        #      seller_custom_field puede quedar viejo si lo escribieron antes.
+        if has_variations:
+            sku = item_data.get("seller_custom_field")
+            if sku:
+                return str(sku)
+            for attr in item_data.get("attributes") or []:
+                if (attr.get("id") or "").upper() == "SELLER_SKU":
+                    val = attr.get("value_name")
+                    if val:
+                        return str(val)
+        else:
+            for attr in item_data.get("attributes") or []:
+                if (attr.get("id") or "").upper() == "SELLER_SKU":
+                    val = attr.get("value_name")
+                    if val:
+                        return str(val)
+            sku = item_data.get("seller_custom_field")
+            if sku:
+                return str(sku)
+
         sku = item_data.get("seller_sku")
         if sku:
             return str(sku)
