@@ -195,7 +195,10 @@ class VentasApp:
             command=self._copy_selected_to_clipboard,
         )
         self.context_menu.add_separator()
-        self.context_menu.add_command(label="Refrescar", command=self.refresh)
+        self.context_menu.add_command(
+            label="Refrescar fila", command=self._refresh_clicked_row
+        )
+        self.context_menu.add_command(label="Refrescar todo", command=self.refresh)
         self.context_menu.bind("<FocusOut>", lambda e: self.context_menu.unpost())
         self._right_clicked_row = None
 
@@ -343,11 +346,11 @@ class VentasApp:
     def _on_right_click(self, event):
         row = self.tree.identify_row(event.y)
         self._right_clicked_row = row
-        # Habilitar/deshabilitar "Copiar título" según si hay una venta debajo del cursor.
+        # Habilitar/deshabilitar items que requieren una hoja.
         is_leaf = bool(row) and self.tree.parent(row) != ""
-        self.context_menu.entryconfig(
-            "Copiar título", state="normal" if is_leaf else "disabled"
-        )
+        leaf_state = "normal" if is_leaf else "disabled"
+        self.context_menu.entryconfig("Copiar título", state=leaf_state)
+        self.context_menu.entryconfig("Refrescar fila", state=leaf_state)
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.focus_set()
 
@@ -365,7 +368,6 @@ class VentasApp:
         win.title("Editar SKU")
         win.transient(self.root)
         win.resizable(False, False)
-        win.grab_set()
 
         frame = ttk.Frame(win, padding=15)
         frame.pack(fill="both", expand=True)
@@ -449,6 +451,15 @@ class VentasApp:
         y = self.root.winfo_y() + (self.root.winfo_height() - win.winfo_height()) // 2
         win.geometry(f"+{x}+{y}")
 
+        # En Wayland la ventana puede no estar "viewable" todavía cuando intentamos
+        # hacer grab_set, lo que da TclError. Reintentamos hasta que esté visible.
+        def _set_grab():
+            try:
+                win.grab_set()
+            except tk.TclError:
+                win.after(50, _set_grab)
+        win.after(10, _set_grab)
+
     def _sku_save_failed(self, win, save_btn, cancel_btn, entry, msg: str):
         save_btn.configure(state="normal", text="Guardar")
         cancel_btn.configure(state="normal")
@@ -495,6 +506,82 @@ class VentasApp:
         )
         with urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
+
+    def _refresh_clicked_row(self):
+        row = self._right_clicked_row
+        if not row or self.tree.parent(row) == "":
+            return
+        self._refresh_leaf(row)
+
+    def _refresh_leaf(self, leaf_id: str):
+        info = self.leaf_to_item.get(leaf_id)
+        if not info or not info.get("item_id"):
+            return
+        item_id = info["item_id"]
+        variation_id = info.get("variation_id")
+        self._flash_status(f"Refrescando {item_id}...", ms=10000)
+
+        def worker():
+            try:
+                url = f"https://api.mercadolibre.com/items/{item_id}"
+                req = Request(
+                    url,
+                    headers={"Authorization": f"Bearer {self.auth.access_token}"},
+                )
+                with urlopen(req, timeout=30) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+            except HTTPError as e:
+                self.root.after(
+                    0,
+                    lambda: self._flash_status(
+                        f"Error refrescando: HTTP {e.code}"
+                    ),
+                )
+                return
+            except Exception as e:
+                self.root.after(
+                    0, lambda: self._flash_status(f"Error refrescando: {e}")
+                )
+                return
+
+            new_sku = self._extract_sku_from_item(data, variation_id)
+            self.root.after(0, lambda: self._on_leaf_refreshed(leaf_id, new_sku))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _extract_sku_from_item(self, item_data: dict, variation_id) -> str:
+        # Si es variación, buscar la variación específica.
+        if variation_id:
+            for v in item_data.get("variations") or []:
+                if v.get("id") == variation_id:
+                    sku = v.get("seller_sku")
+                    if sku:
+                        return str(sku)
+                    for attr in v.get("attributes") or []:
+                        if (attr.get("id") or "").upper() == "SELLER_SKU":
+                            val = attr.get("value_name")
+                            if val:
+                                return str(val)
+        # Item sin variación o no encontrada.
+        sku = item_data.get("seller_sku") or item_data.get("seller_custom_field")
+        if sku:
+            return str(sku)
+        for attr in item_data.get("attributes") or []:
+            if (attr.get("id") or "").upper() == "SELLER_SKU":
+                val = attr.get("value_name")
+                if val:
+                    return str(val)
+        return ""
+
+    def _on_leaf_refreshed(self, leaf_id: str, new_sku: str):
+        info = self.leaf_to_item.get(leaf_id)
+        if info is not None:
+            info["sku"] = new_sku
+        if leaf_id in self.tree.get_children(self.tree.parent(leaf_id)):
+            values = list(self.tree.item(leaf_id, "values"))
+            values[2] = new_sku
+            self.tree.item(leaf_id, values=values)
+        self._flash_status(f"SKU actual: {new_sku or '(vacío)'}")
 
     def _copy_clicked_title(self):
         row = self._right_clicked_row
