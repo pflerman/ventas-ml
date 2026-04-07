@@ -954,6 +954,86 @@ class VentasApp:
         self._update_header_check()
         self._set_loading(False)
 
+        # Disparar refresco de SKUs en background: el endpoint /orders devuelve
+        # snapshot histórico del item, así que el SKU puede estar desactualizado.
+        new_leaf_ids = list(self.row_to_order.keys())[start_idx:]
+        if new_leaf_ids:
+            threading.Thread(
+                target=self._refresh_skus_batch,
+                args=(new_leaf_ids,),
+                daemon=True,
+            ).start()
+
+    def _refresh_skus_batch(self, leaf_ids: list):
+        # Agrupar leaves por item_id (varias órdenes pueden compartir item).
+        item_to_leaves: dict = {}
+        for lid in leaf_ids:
+            info = self.leaf_to_item.get(lid) or {}
+            iid = info.get("item_id")
+            if iid:
+                item_to_leaves.setdefault(iid, []).append(lid)
+
+        if not item_to_leaves:
+            return
+
+        unique_ids = list(item_to_leaves.keys())
+        BATCH = 20
+        item_data: dict = {}
+        for i in range(0, len(unique_ids), BATCH):
+            chunk = unique_ids[i : i + BATCH]
+            url = (
+                "https://api.mercadolibre.com/items?"
+                + urlencode({"ids": ",".join(chunk),
+                             "attributes": "id,seller_sku,attributes,variations"})
+            )
+            try:
+                req = Request(
+                    url,
+                    headers={"Authorization": f"Bearer {self.auth.access_token}"},
+                )
+                with urlopen(req, timeout=30) as resp:
+                    payload = json.loads(resp.read().decode("utf-8"))
+            except Exception:
+                continue
+            # multiget devuelve [{"code":200,"body":{...}}, ...]
+            for entry in payload or []:
+                if entry.get("code") != 200:
+                    continue
+                body = entry.get("body") or {}
+                iid = body.get("id")
+                if iid:
+                    item_data[iid] = body
+
+        # Calcular SKUs nuevos por leaf y aplicarlos en el main thread.
+        updates: list = []
+        for iid, leaves in item_to_leaves.items():
+            body = item_data.get(iid)
+            if not body:
+                continue
+            for lid in leaves:
+                info = self.leaf_to_item.get(lid) or {}
+                new_sku = self._extract_sku_from_item(body, info.get("variation_id"))
+                if new_sku and new_sku != info.get("sku"):
+                    updates.append((lid, new_sku))
+
+        if updates:
+            self.root.after(0, lambda: self._apply_sku_updates(updates))
+
+    def _apply_sku_updates(self, updates: list):
+        for lid, new_sku in updates:
+            info = self.leaf_to_item.get(lid)
+            if info is not None:
+                info["sku"] = new_sku
+            try:
+                parent = self.tree.parent(lid)
+            except tk.TclError:
+                continue
+            if lid in self.tree.get_children(parent):
+                values = list(self.tree.item(lid, "values"))
+                values[2] = new_sku
+                self.tree.item(lid, values=values)
+        self._flash_status(f"SKUs sincronizados ({len(updates)})")
+
     def _get_or_create_day(self, day_key: str) -> str:
         if day_key in self.day_nodes:
             return self.day_nodes[day_key]
