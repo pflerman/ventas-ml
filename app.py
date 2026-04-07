@@ -529,9 +529,7 @@ class VentasApp:
                 vid = int(variation_id)
             except (TypeError, ValueError):
                 vid = variation_id
-            # Hacemos GET del item completo, modificamos el atributo SELLER_SKU
-            # de la variación específica preservando el resto, y mandamos un
-            # PUT con el atributo actualizado.
+
             item_data = self._get_item(item_id)
             target = None
             for v in item_data.get("variations") or []:
@@ -543,55 +541,84 @@ class VentasApp:
                     f"No se encontró la variación {vid} en el item {item_id}"
                 )
 
+            # Diagnóstico: log del estado actual de la variación.
+            print(f"\n[SKU UPDATE] item={item_id} variation={vid}", flush=True)
+            print(f"  variation.seller_sku = {target.get('seller_sku')!r}", flush=True)
+            print(f"  variation.attributes = {target.get('attributes')!r}", flush=True)
+            print(f"  variation.attribute_combinations = {target.get('attribute_combinations')!r}", flush=True)
+            print(f"  → setting to: {new_sku!r}", flush=True)
+
             attrs = list(target.get("attributes") or [])
             updated = False
             for i, attr in enumerate(attrs):
                 if (attr.get("id") or "").upper() == "SELLER_SKU":
-                    new_attr = {"id": "SELLER_SKU", "value_name": new_sku}
-                    attrs[i] = new_attr
+                    attrs[i] = {"id": "SELLER_SKU", "value_name": new_sku}
                     updated = True
                     break
             if not updated:
                 attrs.append({"id": "SELLER_SKU", "value_name": new_sku})
 
-            var_url = f"{item_url}/variations/{vid}"
-            # 1) Endpoint sub-recurso: suele saltearse la validación del padre.
-            try:
-                return self._do_put(var_url, {"attributes": attrs})
-            except HTTPError as e:
-                err_body = self._read_err_body(e)
-                if not (e.code == 400 and "item.pictures.max" in err_body):
-                    raise HTTPError(
-                        e.url, e.code, e.reason, e.headers,
-                        io.BytesIO(err_body.encode("utf-8")),
-                    )
+            # Estrategia: PUT al item entero con la variación completa.
+            # Incluimos attribute_combinations + attributes + seller_sku al
+            # nivel de variación para cubrir todas las formas en que ML
+            # almacena el SKU.
+            var_payload = {
+                "id": vid,
+                "seller_sku": new_sku,
+                "attributes": attrs,
+            }
+            if target.get("attribute_combinations") is not None:
+                var_payload["attribute_combinations"] = target["attribute_combinations"]
 
-            # 2) Fallback: PUT al item con la variación completa.
+            result = None
+            last_err = None
             try:
-                return self._do_put(
-                    item_url,
-                    {"variations": [{"id": vid, "attributes": attrs}]},
+                result = self._do_put(
+                    item_url, {"variations": [var_payload]}
                 )
             except HTTPError as e:
                 body_text = self._read_err_body(e)
+                last_err = (e, body_text)
                 if e.code == 400 and "item.pictures.max" in body_text:
-                    raise HTTPError(
-                        e.url, e.code, e.reason, e.headers,
-                        io.BytesIO(
-                            (
-                                "El item tiene más de 12 fotos y la categoría "
-                                "ya no permite ese límite. ML re-valida todo el "
-                                "item al editar cualquier campo, así que no se "
-                                "puede actualizar el SKU sin reducir las fotos "
-                                "primero desde el panel de Mercado Libre.\n\n"
-                                + body_text
-                            ).encode("utf-8")
-                        ),
+                    # Probar el sub-endpoint que suele saltearse la validación.
+                    var_url = f"{item_url}/variations/{vid}"
+                    try:
+                        result = self._do_put(
+                            var_url,
+                            {"seller_sku": new_sku, "attributes": attrs},
+                        )
+                        last_err = None
+                    except HTTPError as e2:
+                        last_err = (e2, self._read_err_body(e2))
+
+            if result is None and last_err:
+                e, body_text = last_err
+                msg = body_text
+                if e.code == 400 and "item.pictures.max" in body_text:
+                    msg = (
+                        "El item tiene más de 12 fotos y la categoría ya no "
+                        "permite ese límite. ML re-valida todo el item al "
+                        "editar cualquier campo, así que no se puede actualizar "
+                        "el SKU sin reducir las fotos primero desde el panel "
+                        "de Mercado Libre.\n\n" + body_text
                     )
                 raise HTTPError(
                     e.url, e.code, e.reason, e.headers,
-                    io.BytesIO(body_text.encode("utf-8")),
+                    io.BytesIO(msg.encode("utf-8")),
                 )
+
+            # Verificar que el cambio se haya aplicado realmente.
+            verify = self._get_item(item_id)
+            actual = self._extract_sku_from_item(verify, vid)
+            print(f"  ← after PUT, actual SKU = {actual!r}", flush=True)
+            if actual != new_sku:
+                raise RuntimeError(
+                    f"ML aceptó el PUT (200 OK) pero NO aplicó el cambio.\n\n"
+                    f"SKU que intentamos setear: {new_sku!r}\n"
+                    f"SKU actual en ML después del PUT: {actual!r}\n\n"
+                    f"Mirá la consola para más detalles del estado actual de la variación."
+                )
+            return result
 
         # Item sin variación.
         try:
