@@ -579,20 +579,29 @@ class VentasApp:
                     e.url, e.code, e.reason, e.headers,
                     io.BytesIO(msg.encode("utf-8")),
                 )
+        elif target_var is not None:
+            # Item con variaciones pero la variación no tiene attributes propios.
+            # No podemos usar item.attributes[SELLER_SKU] porque ML rechaza con
+            # "item.attributes.invalid: Same attributes are used in item and
+            # variations". El único camino que funciona es seller_custom_field.
+            print(f"  → item con variaciones sin SKU per-variación → seller_custom_field", flush=True)
+            result = self._do_put(item_url, {"seller_custom_field": new_sku})
         else:
-            # Item-level: probar attributes; si falla por fotos, fallback a
-            # seller_custom_field (campo legacy que no dispara validación full).
-            print(f"  → SKU vive a nivel item, no variación", flush=True)
+            # Item plano sin variaciones: probar attributes primero; si falla
+            # por fotos, fallback a seller_custom_field.
+            print(f"  → item plano, intentando attributes[SELLER_SKU]", flush=True)
             try:
                 result = self._do_put(
                     item_url,
                     {"attributes": [{"id": "SELLER_SKU", "value_name": new_sku}]},
                 )
-                print(f"  → escrito vía attributes[SELLER_SKU]", flush=True)
             except HTTPError as e:
                 body_text = self._read_err_body(e)
-                if e.code == 400 and "item.pictures.max" in body_text:
-                    print(f"  → fallback a seller_custom_field (item.pictures.max)", flush=True)
+                if e.code == 400 and (
+                    "item.pictures.max" in body_text
+                    or "item.attributes.invalid" in body_text
+                ):
+                    print(f"  → fallback a seller_custom_field", flush=True)
                     result = self._do_put(
                         item_url, {"seller_custom_field": new_sku}
                     )
