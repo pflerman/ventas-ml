@@ -82,6 +82,26 @@ def format_time(dt) -> str:
     return dt.strftime("%H:%M") if dt else ""
 
 
+def extract_sku(order_item: dict) -> str:
+    """SKU puede venir en distintos campos según el item."""
+    item = order_item.get("item") or {}
+    # 1. seller_sku directo del item
+    sku = item.get("seller_sku")
+    if sku:
+        return str(sku)
+    # 2. seller_custom_field (legacy)
+    sku = item.get("seller_custom_field")
+    if sku:
+        return str(sku)
+    # 3. variation_attributes con SELLER_SKU
+    for attr in item.get("variation_attributes") or []:
+        if (attr.get("id") or "").upper() == "SELLER_SKU":
+            v = attr.get("value_name")
+            if v:
+                return str(v)
+    return ""
+
+
 def format_price(value) -> str:
     try:
         n = float(value)
@@ -142,7 +162,7 @@ class VentasApp:
         tree_frame = ttk.Frame(container)
         tree_frame.pack(fill="both", expand=True)
 
-        columns = ("check", "fecha", "producto", "precio")
+        columns = ("check", "fecha", "sku", "producto", "precio")
         self.tree = ttk.Treeview(
             tree_frame,
             columns=columns,
@@ -152,13 +172,15 @@ class VentasApp:
         self.tree.heading("#0", text="Día")
         self.tree.heading("check", text=UNCHECKED, command=self._toggle_all)
         self.tree.heading("fecha", text="Hora")
+        self.tree.heading("sku", text="SKU")
         self.tree.heading("producto", text="Producto")
         self.tree.heading("precio", text="Precio")
-        self.tree.column("#0", width=220, anchor="w", stretch=False)
+        self.tree.column("#0", width=200, anchor="w", stretch=False)
         self.tree.column("check", width=40, anchor="center", stretch=False)
-        self.tree.column("fecha", width=70, anchor="w", stretch=False)
-        self.tree.column("producto", width=440, anchor="w")
-        self.tree.column("precio", width=120, anchor="e", stretch=False)
+        self.tree.column("fecha", width=60, anchor="w", stretch=False)
+        self.tree.column("sku", width=90, anchor="w", stretch=False)
+        self.tree.column("producto", width=380, anchor="w")
+        self.tree.column("precio", width=110, anchor="e", stretch=False)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Button-3>", self._on_right_click)
 
@@ -318,13 +340,13 @@ class VentasApp:
                 if order_id not in self.selected_ids:
                     continue
                 values = self.tree.item(leaf_id, "values")
-                _, time_str, title, price_str = values
+                _, time_str, sku, title, price_str = values
                 try:
                     n = float(price_str.replace("$", "").replace(".", "").replace(",", "."))
                 except (ValueError, AttributeError):
                     n = 0.0
                 grand_total += n
-                days.setdefault(day_key, []).append((time_str, title, price_str, n))
+                days.setdefault(day_key, []).append((time_str, sku, title, price_str, n))
 
         def _key(d):
             try:
@@ -348,8 +370,9 @@ class VentasApp:
         lines = [f"*Ventas seleccionadas* ({total_count})", ""]
         for d in ordered:
             lines.append(f"📅 *{d}*")
-            for time_str, title, price_str, _ in days[d]:
-                lines.append(f"• {time_str} — {title} — {price_str}")
+            for time_str, sku, title, price_str, _ in days[d]:
+                sku_part = f" [{sku}]" if sku else ""
+                lines.append(f"• {time_str} — {title}{sku_part} — {price_str}")
             lines.append("")
         lines.append(f"*Total: {format_price(grand_total)}*")
         text = "\n".join(lines)
@@ -401,7 +424,7 @@ class VentasApp:
         left = Alignment(horizontal="left", vertical="center", wrap_text=True)
         right = Alignment(horizontal="right", vertical="center")
 
-        headers = ["Fecha", "Hora", "Producto", "Precio", "Notas"]
+        headers = ["Fecha", "Hora", "SKU", "Producto", "Precio", "Notas"]
         ws.append(headers)
         for col_idx, _ in enumerate(headers, start=1):
             cell = ws.cell(row=1, column=col_idx)
@@ -412,35 +435,36 @@ class VentasApp:
 
         row_idx = 2
         for d in ordered:
-            for time_str, title, price_str, n in days[d]:
+            for time_str, sku, title, price_str, n in days[d]:
                 ws.cell(row=row_idx, column=1, value=d).alignment = center
                 ws.cell(row=row_idx, column=2, value=time_str).alignment = center
-                ws.cell(row=row_idx, column=3, value=title).alignment = left
-                price_cell = ws.cell(row=row_idx, column=4, value=n)
+                ws.cell(row=row_idx, column=3, value=sku).alignment = center
+                ws.cell(row=row_idx, column=4, value=title).alignment = left
+                price_cell = ws.cell(row=row_idx, column=5, value=n)
                 price_cell.number_format = '"$"#,##0.00'
                 price_cell.alignment = right
-                ws.cell(row=row_idx, column=5, value="")  # campo notas vacío
-                for c in range(1, 6):
+                ws.cell(row=row_idx, column=6, value="")  # campo notas vacío
+                for c in range(1, 7):
                     ws.cell(row=row_idx, column=c).border = border
                 ws.row_dimensions[row_idx].height = 32  # más alto para escribir notas
                 row_idx += 1
 
         # Fila de total
         ws.cell(row=row_idx, column=1, value="TOTAL").font = bold
-        ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=3)
+        ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=4)
         merged = ws.cell(row=row_idx, column=1)
         merged.alignment = right
-        total_cell = ws.cell(row=row_idx, column=4, value=grand_total)
+        total_cell = ws.cell(row=row_idx, column=5, value=grand_total)
         total_cell.font = bold
         total_cell.number_format = '"$"#,##0.00'
         total_cell.alignment = right
-        ws.cell(row=row_idx, column=5, value="")
-        for c in range(1, 6):
+        ws.cell(row=row_idx, column=6, value="")
+        for c in range(1, 7):
             ws.cell(row=row_idx, column=c).border = border
             ws.cell(row=row_idx, column=c).fill = day_fill
 
         # Anchos de columna
-        widths = {1: 13, 2: 8, 3: 55, 4: 14, 5: 35}
+        widths = {1: 13, 2: 8, 3: 14, 4: 45, 5: 14, 6: 30}
         for col, w in widths.items():
             ws.column_dimensions[get_column_letter(col)].width = w
 
@@ -547,6 +571,7 @@ class VentasApp:
             first = items[0] if items else {}
             item = first.get("item") or {}
             title = item.get("title", "(sin título)")
+            sku = extract_sku(first)
             unit_price = first.get("unit_price")
             price_str = format_price(unit_price)
             dt = parse_iso(order.get("date_created", ""))
@@ -561,7 +586,7 @@ class VentasApp:
             leaf_id = self.tree.insert(
                 parent_id,
                 "end",
-                values=(mark, time_str, title, price_str),
+                values=(mark, time_str, sku, title, price_str),
                 tags=tags,
             )
             self.row_to_order[leaf_id] = order_id
@@ -588,7 +613,7 @@ class VentasApp:
             "",
             "end",
             text=day_key,
-            values=(UNCHECKED, "", "", ""),
+            values=(UNCHECKED, "", "", "", ""),
             tags=("day",),
             open=True,
         )
