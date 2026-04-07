@@ -524,31 +524,33 @@ class VentasApp:
     def _put_item_sku(self, item_id: str, variation_id, new_sku: str):
         item_url = f"https://api.mercadolibre.com/items/{item_id}"
 
+        # Decidir si el SKU vive en la variación o en el item.
+        target_var = None
+        vid = None
         if variation_id:
             try:
                 vid = int(variation_id)
             except (TypeError, ValueError):
                 vid = variation_id
-
             item_data = self._get_item(item_id)
-            target = None
             for v in item_data.get("variations") or []:
                 if v.get("id") == vid:
-                    target = v
+                    target_var = v
                     break
-            if target is None:
-                raise ValueError(
-                    f"No se encontró la variación {vid} en el item {item_id}"
-                )
-
-            # Diagnóstico: log del estado actual de la variación.
             print(f"\n[SKU UPDATE] item={item_id} variation={vid}", flush=True)
-            print(f"  variation.seller_sku = {target.get('seller_sku')!r}", flush=True)
-            print(f"  variation.attributes = {target.get('attributes')!r}", flush=True)
-            print(f"  variation.attribute_combinations = {target.get('attribute_combinations')!r}", flush=True)
+            if target_var:
+                print(f"  variation.seller_sku = {target_var.get('seller_sku')!r}", flush=True)
+                print(f"  variation.attributes = {target_var.get('attributes')!r}", flush=True)
+                print(f"  variation.attribute_combinations = {target_var.get('attribute_combinations')!r}", flush=True)
             print(f"  → setting to: {new_sku!r}", flush=True)
 
-            attrs = list(target.get("attributes") or [])
+        # La variación tiene SKU propio sólo si su array attributes existe.
+        # Si attributes es None, las variaciones se diferencian sólo por
+        # combinations (color/talle) y el SKU vive a nivel item.
+        use_variation_path = bool(target_var and target_var.get("attributes"))
+
+        if use_variation_path:
+            attrs = list(target_var.get("attributes") or [])
             updated = False
             for i, attr in enumerate(attrs):
                 if (attr.get("id") or "").upper() == "SELLER_SKU":
@@ -558,84 +560,88 @@ class VentasApp:
             if not updated:
                 attrs.append({"id": "SELLER_SKU", "value_name": new_sku})
 
-            # Estrategia: PUT al item entero con la variación completa.
-            # Incluimos attribute_combinations + attributes + seller_sku al
-            # nivel de variación para cubrir todas las formas en que ML
-            # almacena el SKU.
-            var_payload = {
-                "id": vid,
-                "seller_sku": new_sku,
-                "attributes": attrs,
-            }
-            if target.get("attribute_combinations") is not None:
-                var_payload["attribute_combinations"] = target["attribute_combinations"]
-
-            result = None
-            last_err = None
             try:
                 result = self._do_put(
-                    item_url, {"variations": [var_payload]}
+                    item_url,
+                    {"variations": [{"id": vid, "attributes": attrs}]},
                 )
             except HTTPError as e:
                 body_text = self._read_err_body(e)
-                last_err = (e, body_text)
-                if e.code == 400 and "item.pictures.max" in body_text:
-                    # Probar el sub-endpoint que suele saltearse la validación.
-                    var_url = f"{item_url}/variations/{vid}"
-                    try:
-                        result = self._do_put(
-                            var_url,
-                            {"seller_sku": new_sku, "attributes": attrs},
-                        )
-                        last_err = None
-                    except HTTPError as e2:
-                        last_err = (e2, self._read_err_body(e2))
-
-            if result is None and last_err:
-                e, body_text = last_err
-                msg = body_text
                 if e.code == 400 and "item.pictures.max" in body_text:
                     msg = (
                         "El item tiene más de 12 fotos y la categoría ya no "
-                        "permite ese límite. ML re-valida todo el item al "
-                        "editar cualquier campo, así que no se puede actualizar "
-                        "el SKU sin reducir las fotos primero desde el panel "
-                        "de Mercado Libre.\n\n" + body_text
+                        "permite ese límite. Reducí las fotos desde el panel "
+                        "de Mercado Libre y volvé a intentar.\n\n" + body_text
                     )
+                else:
+                    msg = body_text
                 raise HTTPError(
                     e.url, e.code, e.reason, e.headers,
                     io.BytesIO(msg.encode("utf-8")),
                 )
-
-            # Verificar que el cambio se haya aplicado realmente.
-            verify = self._get_item(item_id)
-            actual = self._extract_sku_from_item(verify, vid)
-            print(f"  ← after PUT, actual SKU = {actual!r}", flush=True)
-            if actual != new_sku:
-                raise RuntimeError(
-                    f"ML aceptó el PUT (200 OK) pero NO aplicó el cambio.\n\n"
-                    f"SKU que intentamos setear: {new_sku!r}\n"
-                    f"SKU actual en ML después del PUT: {actual!r}\n\n"
-                    f"Mirá la consola para más detalles del estado actual de la variación."
+        else:
+            # Item-level: probar attributes; si falla por fotos, fallback a
+            # seller_custom_field (campo legacy que no dispara validación full).
+            print(f"  → SKU vive a nivel item, no variación", flush=True)
+            try:
+                result = self._do_put(
+                    item_url,
+                    {"attributes": [{"id": "SELLER_SKU", "value_name": new_sku}]},
                 )
+                print(f"  → escrito vía attributes[SELLER_SKU]", flush=True)
+            except HTTPError as e:
+                body_text = self._read_err_body(e)
+                if e.code == 400 and "item.pictures.max" in body_text:
+                    print(f"  → fallback a seller_custom_field (item.pictures.max)", flush=True)
+                    result = self._do_put(
+                        item_url, {"seller_custom_field": new_sku}
+                    )
+                else:
+                    raise HTTPError(
+                        e.url, e.code, e.reason, e.headers,
+                        io.BytesIO(body_text.encode("utf-8")),
+                    )
+
+        # Verificar mirando todos los lugares posibles.
+        verify = self._get_item(item_id)
+        if self._sku_present_anywhere(verify, vid, new_sku):
+            actual = self._extract_sku_from_item(verify, vid)
+            print(f"  ← after PUT, actual SKU = {actual!r} ✓", flush=True)
             return result
 
-        # Item sin variación.
-        try:
-            return self._do_put(
-                item_url,
-                {"attributes": [{"id": "SELLER_SKU", "value_name": new_sku}]},
-            )
-        except HTTPError as e:
-            body_text = self._read_err_body(e)
-            if e.code == 400 and "item.pictures.max" in body_text:
-                return self._do_put(
-                    item_url, {"seller_custom_field": new_sku}
-                )
-            raise HTTPError(
-                e.url, e.code, e.reason, e.headers,
-                io.BytesIO(body_text.encode("utf-8")),
-            )
+        actual = self._extract_sku_from_item(verify, vid)
+        print(f"  ← after PUT, actual SKU = {actual!r} ✗", flush=True)
+        raise RuntimeError(
+            f"ML aceptó el PUT (200 OK) pero NO aplicó el cambio.\n\n"
+            f"SKU que intentamos setear: {new_sku!r}\n"
+            f"SKU actual en ML: {actual!r}"
+        )
+
+    def _sku_present_anywhere(self, item_data: dict, variation_id, expected: str) -> bool:
+        """True si `expected` aparece en cualquier campo plausible de SKU."""
+        if not expected:
+            return False
+        if variation_id:
+            try:
+                vid = int(variation_id)
+            except (TypeError, ValueError):
+                vid = variation_id
+            for v in item_data.get("variations") or []:
+                if v.get("id") == vid:
+                    if v.get("seller_sku") == expected:
+                        return True
+                    for attr in v.get("attributes") or []:
+                        if (attr.get("id") or "").upper() == "SELLER_SKU" and attr.get("value_name") == expected:
+                            return True
+                    break
+        if item_data.get("seller_custom_field") == expected:
+            return True
+        if item_data.get("seller_sku") == expected:
+            return True
+        for attr in item_data.get("attributes") or []:
+            if (attr.get("id") or "").upper() == "SELLER_SKU" and attr.get("value_name") == expected:
+                return True
+        return False
 
     def _get_item(self, item_id: str) -> dict:
         url = f"https://api.mercadolibre.com/items/{item_id}"
@@ -705,10 +711,7 @@ class VentasApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _extract_sku_from_item(self, item_data: dict, variation_id) -> str:
-        # Si es variación, buscar la variación específica. Prioridad: el atributo
-        # SELLER_SKU es la fuente canónica que coincide con lo que reporta /orders
-        # y lo que muestra ML. El campo .seller_sku es un alias que puede quedar
-        # desincronizado.
+        # Variación con sus propios atributos: ese es el SKU canónico.
         if variation_id:
             try:
                 vid = int(variation_id)
@@ -724,14 +727,18 @@ class VentasApp:
                     sku = v.get("seller_sku")
                     if sku:
                         return str(sku)
-        # Item sin variación o no encontrada: atributo primero, luego campos
-        # de top-level.
+                    break
+        # Fallback al item-level: priorizamos seller_custom_field porque es
+        # nuestro target de escritura cuando el item tiene fotos en exceso.
+        sku = item_data.get("seller_custom_field")
+        if sku:
+            return str(sku)
         for attr in item_data.get("attributes") or []:
             if (attr.get("id") or "").upper() == "SELLER_SKU":
                 val = attr.get("value_name")
                 if val:
                     return str(val)
-        sku = item_data.get("seller_sku") or item_data.get("seller_custom_field")
+        sku = item_data.get("seller_sku")
         if sku:
             return str(sku)
         return ""
