@@ -194,6 +194,8 @@ class VentasApp:
             label="Copiar selección (WhatsApp)",
             command=self._copy_selected_to_clipboard,
         )
+        self.context_menu.add_separator()
+        self.context_menu.add_command(label="Refrescar", command=self.refresh)
         self.context_menu.bind("<FocusOut>", lambda e: self.context_menu.unpost())
         self._right_clicked_row = None
 
