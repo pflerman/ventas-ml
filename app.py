@@ -165,7 +165,7 @@ class VentasApp:
         tree_frame = ttk.Frame(container)
         tree_frame.pack(fill="both", expand=True)
 
-        columns = ("check", "fecha", "sku", "producto", "precio")
+        columns = ("check", "fecha", "sku", "cant", "producto", "precio")
         self.tree = ttk.Treeview(
             tree_frame,
             columns=columns,
@@ -176,13 +176,15 @@ class VentasApp:
         self.tree.heading("check", text=UNCHECKED, command=self._toggle_all)
         self.tree.heading("fecha", text="Hora")
         self.tree.heading("sku", text="SKU")
+        self.tree.heading("cant", text="Cant")
         self.tree.heading("producto", text="Producto")
         self.tree.heading("precio", text="Precio")
         self.tree.column("#0", width=200, anchor="w", stretch=False)
         self.tree.column("check", width=40, anchor="center", stretch=False)
         self.tree.column("fecha", width=60, anchor="w", stretch=False)
         self.tree.column("sku", width=90, anchor="w", stretch=False)
-        self.tree.column("producto", width=380, anchor="w")
+        self.tree.column("cant", width=50, anchor="center", stretch=False)
+        self.tree.column("producto", width=340, anchor="w")
         self.tree.column("precio", width=110, anchor="e", stretch=False)
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Button-3>", self._on_right_click)
@@ -828,13 +830,14 @@ class VentasApp:
                 if order_id not in self.selected_ids:
                     continue
                 values = self.tree.item(leaf_id, "values")
-                _, time_str, sku, title, price_str = values
-                try:
-                    n = float(price_str.replace("$", "").replace(".", "").replace(",", "."))
-                except (ValueError, AttributeError):
-                    n = 0.0
-                grand_total += n
-                days.setdefault(day_key, []).append((time_str, sku, title, price_str, n))
+                _, time_str, sku, qty, title, price_str = values
+                info = self.leaf_to_item.get(leaf_id) or {}
+                quantity = int(info.get("quantity") or qty or 1)
+                line_total = float(info.get("line_total") or 0.0)
+                grand_total += line_total
+                days.setdefault(day_key, []).append(
+                    (time_str, sku, quantity, title, price_str, line_total)
+                )
 
         def _key(d):
             try:
@@ -858,9 +861,10 @@ class VentasApp:
         lines = [f"*Ventas seleccionadas* ({total_count})", ""]
         for d in ordered:
             lines.append(f"📅 *{d}*")
-            for time_str, sku, title, price_str, _ in days[d]:
+            for time_str, sku, quantity, title, price_str, _ in days[d]:
                 sku_part = f" [{sku}]" if sku else ""
-                lines.append(f"• {time_str} — {title}{sku_part} — {price_str}")
+                qty_part = f" x{quantity}" if quantity and quantity != 1 else ""
+                lines.append(f"• {time_str} — {title}{sku_part}{qty_part} — {price_str}")
             lines.append("")
         lines.append(f"*Total: {format_price(grand_total)}*")
         text = "\n".join(lines)
@@ -913,7 +917,7 @@ class VentasApp:
         left = Alignment(horizontal="left", vertical="center", wrap_text=True, indent=1)
         right = Alignment(horizontal="right", vertical="center", indent=1)
 
-        headers = ["Fecha", "Hora", "SKU", "Producto", "Precio", "Notas"]
+        headers = ["Fecha", "Hora", "SKU", "Cant", "Producto", "Precio", "Notas"]
         ws.append(headers)
         for col_idx, _ in enumerate(headers, start=1):
             cell = ws.cell(row=1, column=col_idx)
@@ -922,18 +926,20 @@ class VentasApp:
             cell.fill = header_fill
             cell.border = border
 
+        ncols = len(headers)
         row_idx = 2
         for d in ordered:
-            for time_str, sku, title, price_str, n in days[d]:
+            for time_str, sku, quantity, title, price_str, line_total in days[d]:
                 ws.cell(row=row_idx, column=1, value=d).alignment = center
                 ws.cell(row=row_idx, column=2, value=time_str).alignment = center
                 ws.cell(row=row_idx, column=3, value=sku).alignment = center
-                ws.cell(row=row_idx, column=4, value=title).alignment = left
-                price_cell = ws.cell(row=row_idx, column=5, value=n)
+                ws.cell(row=row_idx, column=4, value=quantity).alignment = center
+                ws.cell(row=row_idx, column=5, value=title).alignment = left
+                price_cell = ws.cell(row=row_idx, column=6, value=line_total)
                 price_cell.number_format = '"$"#,##0.00'
                 price_cell.alignment = right
-                ws.cell(row=row_idx, column=6, value="")  # campo notas vacío
-                for c in range(1, 7):
+                ws.cell(row=row_idx, column=7, value="")  # campo notas vacío
+                for c in range(1, ncols + 1):
                     cell = ws.cell(row=row_idx, column=c)
                     cell.border = border
                     cell.font = base_font
@@ -942,20 +948,20 @@ class VentasApp:
 
         # Fila de total
         ws.cell(row=row_idx, column=1, value="TOTAL").font = bold
-        ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=4)
+        ws.merge_cells(start_row=row_idx, start_column=1, end_row=row_idx, end_column=5)
         merged = ws.cell(row=row_idx, column=1)
         merged.alignment = right
-        total_cell = ws.cell(row=row_idx, column=5, value=grand_total)
+        total_cell = ws.cell(row=row_idx, column=6, value=grand_total)
         total_cell.font = bold
         total_cell.number_format = '"$"#,##0.00'
         total_cell.alignment = right
-        ws.cell(row=row_idx, column=6, value="")
-        for c in range(1, 7):
+        ws.cell(row=row_idx, column=7, value="")
+        for c in range(1, ncols + 1):
             ws.cell(row=row_idx, column=c).border = border
             ws.cell(row=row_idx, column=c).fill = day_fill
 
         # Anchos de columna (más amplios para fuente más grande + padding)
-        widths = {1: 16, 2: 11, 3: 18, 4: 60, 5: 18, 6: 38}
+        widths = {1: 16, 2: 11, 3: 18, 4: 9, 5: 60, 6: 18, 7: 38}
         for col, w in widths.items():
             ws.column_dimensions[get_column_letter(col)].width = w
 
@@ -1094,6 +1100,15 @@ class VentasApp:
             title = item.get("title", "(sin título)")
             sku = extract_sku(first)
             unit_price = first.get("unit_price")
+            try:
+                quantity = int(first.get("quantity") or 1)
+            except (TypeError, ValueError):
+                quantity = 1
+            try:
+                unit_price_num = float(unit_price or 0)
+            except (TypeError, ValueError):
+                unit_price_num = 0.0
+            line_total = unit_price_num * quantity
             price_str = format_price(unit_price)
             dt = parse_iso(order.get("date_created", ""))
             day_key = format_day(dt)
@@ -1107,7 +1122,7 @@ class VentasApp:
             leaf_id = self.tree.insert(
                 parent_id,
                 "end",
-                values=(mark, time_str, sku, title, price_str),
+                values=(mark, time_str, sku, quantity, title, price_str),
                 tags=tags,
             )
             self.row_to_order[leaf_id] = order_id
@@ -1117,13 +1132,13 @@ class VentasApp:
                 "variation_id": item.get("variation_id"),
                 "sku": sku,
                 "title": title,
+                "quantity": quantity,
+                "unit_price": unit_price_num,
+                "line_total": line_total,
             }
 
             self.day_count[day_key] = self.day_count.get(day_key, 0) + 1
-            try:
-                self.day_total[day_key] = self.day_total.get(day_key, 0.0) + float(unit_price or 0)
-            except (TypeError, ValueError):
-                pass
+            self.day_total[day_key] = self.day_total.get(day_key, 0.0) + line_total
             touched_days.add(day_key)
 
         for day_key in touched_days:
