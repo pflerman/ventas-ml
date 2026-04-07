@@ -186,11 +186,11 @@ class VentasApp:
 
         self.context_menu = tk.Menu(self.tree, tearoff=0)
         self.context_menu.add_command(
-            label="Copiar selección (WhatsApp)",
-            command=self._copy_selected_to_clipboard,
+            label="Copiar título", command=self._copy_clicked_title
         )
         self.context_menu.add_command(
-            label="Copiar título", command=self._copy_clicked_title
+            label="Copiar selección (WhatsApp)",
+            command=self._copy_selected_to_clipboard,
         )
         self.context_menu.bind("<FocusOut>", lambda e: self.context_menu.unpost())
         self._right_clicked_row = None
