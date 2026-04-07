@@ -907,10 +907,11 @@ class VentasApp:
         border = Border(left=thin, right=thin, top=thin, bottom=thin)
         header_fill = PatternFill("solid", fgColor="DCE6F0")
         day_fill = PatternFill("solid", fgColor="F0F4F8")
-        bold = Font(bold=True)
-        center = Alignment(horizontal="center", vertical="center")
-        left = Alignment(horizontal="left", vertical="center", wrap_text=True)
-        right = Alignment(horizontal="right", vertical="center")
+        base_font = Font(size=14)
+        bold = Font(bold=True, size=15)
+        center = Alignment(horizontal="center", vertical="center", indent=1)
+        left = Alignment(horizontal="left", vertical="center", wrap_text=True, indent=1)
+        right = Alignment(horizontal="right", vertical="center", indent=1)
 
         headers = ["Fecha", "Hora", "SKU", "Producto", "Precio", "Notas"]
         ws.append(headers)
@@ -933,8 +934,10 @@ class VentasApp:
                 price_cell.alignment = right
                 ws.cell(row=row_idx, column=6, value="")  # campo notas vacío
                 for c in range(1, 7):
-                    ws.cell(row=row_idx, column=c).border = border
-                ws.row_dimensions[row_idx].height = 32  # más alto para escribir notas
+                    cell = ws.cell(row=row_idx, column=c)
+                    cell.border = border
+                    cell.font = base_font
+                ws.row_dimensions[row_idx].height = 48  # más alto para escribir notas
                 row_idx += 1
 
         # Fila de total
@@ -951,15 +954,15 @@ class VentasApp:
             ws.cell(row=row_idx, column=c).border = border
             ws.cell(row=row_idx, column=c).fill = day_fill
 
-        # Anchos de columna
-        widths = {1: 13, 2: 8, 3: 14, 4: 45, 5: 14, 6: 30}
+        # Anchos de columna (más amplios para fuente más grande + padding)
+        widths = {1: 16, 2: 11, 3: 18, 4: 60, 5: 18, 6: 38}
         for col, w in widths.items():
             ws.column_dimensions[get_column_letter(col)].width = w
 
-        ws.row_dimensions[1].height = 22
+        ws.row_dimensions[1].height = 30
 
-        # Print setup: vertical, ajustar a 1 página de ancho
-        ws.page_setup.orientation = ws.ORIENTATION_PORTRAIT
+        # Print setup: horizontal, ajustar a 1 página de ancho
+        ws.page_setup.orientation = ws.ORIENTATION_LANDSCAPE
         ws.page_setup.fitToWidth = 1
         ws.page_setup.fitToHeight = 0
         ws.sheet_properties.pageSetUpPr.fitToPage = True
