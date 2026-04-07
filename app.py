@@ -522,41 +522,82 @@ class VentasApp:
         self._flash_status(f"SKU actualizado: {new_sku}")
 
     def _put_item_sku(self, item_id: str, variation_id, new_sku: str):
-        url = f"https://api.mercadolibre.com/items/{item_id}"
-        if variation_id:
-            body = {
-                "variations": [
-                    {
-                        "id": int(variation_id),
-                        "attributes": [
-                            {"id": "SELLER_SKU", "value_name": new_sku}
-                        ],
-                    }
-                ]
-            }
-            return self._do_put(url, body)
+        item_url = f"https://api.mercadolibre.com/items/{item_id}"
 
-        # Item sin variación: intentar primero con attributes[SELLER_SKU].
-        # Si falla por item.pictures.max (validación full del item), caemos al
-        # campo legacy seller_custom_field, que es escalar y no dispara la
-        # validación completa.
+        if variation_id:
+            # 1) Endpoint específico de variación: en muchos casos saltea la
+            # validación del item padre (incluyendo item.pictures.max).
+            var_url = f"{item_url}/variations/{int(variation_id)}"
+            try:
+                return self._do_put(
+                    var_url,
+                    {"attributes": [{"id": "SELLER_SKU", "value_name": new_sku}]},
+                )
+            except HTTPError as e:
+                first_err = self._read_err_body(e)
+                if not (e.code == 400 and "item.pictures.max" in first_err):
+                    raise HTTPError(
+                        e.url, e.code, e.reason, e.headers,
+                        io.BytesIO(first_err.encode("utf-8")),
+                    )
+            # 2) Fallback: PUT al item con variations array.
+            try:
+                return self._do_put(
+                    item_url,
+                    {
+                        "variations": [
+                            {
+                                "id": int(variation_id),
+                                "attributes": [
+                                    {"id": "SELLER_SKU", "value_name": new_sku}
+                                ],
+                            }
+                        ]
+                    },
+                )
+            except HTTPError as e:
+                body_text = self._read_err_body(e)
+                if e.code == 400 and "item.pictures.max" in body_text:
+                    raise HTTPError(
+                        e.url, e.code, e.reason, e.headers,
+                        io.BytesIO(
+                            (
+                                "El item tiene más de 12 fotos y la categoría "
+                                "ya no permite ese límite. ML re-valida todo el "
+                                "item al editar cualquier campo, así que no se "
+                                "puede actualizar el SKU sin reducir las fotos "
+                                "primero desde el panel de Mercado Libre.\n\n"
+                                + body_text
+                            ).encode("utf-8")
+                        ),
+                    )
+                raise HTTPError(
+                    e.url, e.code, e.reason, e.headers,
+                    io.BytesIO(body_text.encode("utf-8")),
+                )
+
+        # Item sin variación.
         try:
             return self._do_put(
-                url, {"attributes": [{"id": "SELLER_SKU", "value_name": new_sku}]}
+                item_url,
+                {"attributes": [{"id": "SELLER_SKU", "value_name": new_sku}]},
             )
         except HTTPError as e:
-            try:
-                body_text = e.read().decode("utf-8", errors="replace")
-            except Exception:
-                body_text = ""
+            body_text = self._read_err_body(e)
             if e.code == 400 and "item.pictures.max" in body_text:
-                # Fallback: campo legacy.
-                return self._do_put(url, {"seller_custom_field": new_sku})
-            # Re-raise con el body adjunto para que el handler lo muestre.
+                return self._do_put(
+                    item_url, {"seller_custom_field": new_sku}
+                )
             raise HTTPError(
                 e.url, e.code, e.reason, e.headers,
                 io.BytesIO(body_text.encode("utf-8")),
             )
+
+    def _read_err_body(self, e: HTTPError) -> str:
+        try:
+            return e.read().decode("utf-8", errors="replace")
+        except Exception:
+            return ""
 
     def _do_put(self, url: str, body: dict):
         data = json.dumps(body).encode("utf-8")
