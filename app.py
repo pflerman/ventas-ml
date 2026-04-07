@@ -184,6 +184,16 @@ class VentasApp:
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Button-3>", self._on_right_click)
 
+        self.context_menu = tk.Menu(self.tree, tearoff=0)
+        self.context_menu.add_command(
+            label="Copiar selección (WhatsApp)",
+            command=self._copy_selected_to_clipboard,
+        )
+        self.context_menu.add_command(
+            label="Copiar título", command=self._copy_clicked_title
+        )
+        self._right_clicked_row = None
+
         self.tree.tag_configure("odd", background="#f5f5f5")
         self.tree.tag_configure("even", background="#ffffff")
         self.tree.tag_configure("selected", background="#C6EFCE")
@@ -326,7 +336,31 @@ class VentasApp:
         return (base,)
 
     def _on_right_click(self, event):
-        self._copy_selected_to_clipboard()
+        row = self.tree.identify_row(event.y)
+        self._right_clicked_row = row
+        # Habilitar/deshabilitar "Copiar título" según si hay una venta debajo del cursor.
+        is_leaf = bool(row) and self.tree.parent(row) != ""
+        self.context_menu.entryconfig(
+            "Copiar título", state="normal" if is_leaf else "disabled"
+        )
+        try:
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.context_menu.grab_release()
+
+    def _copy_clicked_title(self):
+        row = self._right_clicked_row
+        if not row or self.tree.parent(row) == "":
+            return
+        values = self.tree.item(row, "values")
+        # values = (check, time, sku, title, price)
+        if len(values) < 4:
+            return
+        title = values[3]
+        self.root.clipboard_clear()
+        self.root.clipboard_append(title)
+        self.root.update()
+        self._flash_status("Título copiado ✓")
 
     def _collect_selected(self):
         """Devuelve (ordered_days, days_dict, grand_total, count). Lee del Treeview."""
