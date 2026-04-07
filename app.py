@@ -462,19 +462,20 @@ class VentasApp:
                         body = e.read().decode("utf-8", errors="replace")[:300]
                     except Exception:
                         pass
+                    msg = f"HTTP {e.code}: {e.reason}\n{body}"
                     self.root.after(
                         0,
-                        lambda: self._sku_save_failed(
-                            win, save_btn, cancel_btn, entry,
-                            f"HTTP {e.code}: {e.reason}\n{body}",
+                        lambda m=msg: self._sku_save_failed(
+                            win, save_btn, cancel_btn, entry, m
                         ),
                     )
                     return
                 except Exception as e:
+                    msg = str(e)
                     self.root.after(
                         0,
-                        lambda: self._sku_save_failed(
-                            win, save_btn, cancel_btn, entry, str(e)
+                        lambda m=msg: self._sku_save_failed(
+                            win, save_btn, cancel_btn, entry, m
                         ),
                     )
                     return
@@ -574,17 +575,12 @@ class VentasApp:
                 with urlopen(req, timeout=30) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
             except HTTPError as e:
-                self.root.after(
-                    0,
-                    lambda: self._flash_status(
-                        f"Error refrescando: HTTP {e.code}"
-                    ),
-                )
+                msg = f"Error refrescando: HTTP {e.code}"
+                self.root.after(0, lambda m=msg: self._flash_status(m))
                 return
             except Exception as e:
-                self.root.after(
-                    0, lambda: self._flash_status(f"Error refrescando: {e}")
-                )
+                msg = f"Error refrescando: {e}"
+                self.root.after(0, lambda m=msg: self._flash_status(m))
                 return
 
             new_sku = self._extract_sku_from_item(data, variation_id)
