@@ -525,35 +525,52 @@ class VentasApp:
         item_url = f"https://api.mercadolibre.com/items/{item_id}"
 
         if variation_id:
-            # 1) Endpoint específico de variación: en muchos casos saltea la
-            # validación del item padre (incluyendo item.pictures.max).
-            var_url = f"{item_url}/variations/{int(variation_id)}"
             try:
-                return self._do_put(
-                    var_url,
-                    {"attributes": [{"id": "SELLER_SKU", "value_name": new_sku}]},
+                vid = int(variation_id)
+            except (TypeError, ValueError):
+                vid = variation_id
+            # Hacemos GET del item completo, modificamos el atributo SELLER_SKU
+            # de la variación específica preservando el resto, y mandamos un
+            # PUT con el atributo actualizado.
+            item_data = self._get_item(item_id)
+            target = None
+            for v in item_data.get("variations") or []:
+                if v.get("id") == vid:
+                    target = v
+                    break
+            if target is None:
+                raise ValueError(
+                    f"No se encontró la variación {vid} en el item {item_id}"
                 )
+
+            attrs = list(target.get("attributes") or [])
+            updated = False
+            for i, attr in enumerate(attrs):
+                if (attr.get("id") or "").upper() == "SELLER_SKU":
+                    new_attr = {"id": "SELLER_SKU", "value_name": new_sku}
+                    attrs[i] = new_attr
+                    updated = True
+                    break
+            if not updated:
+                attrs.append({"id": "SELLER_SKU", "value_name": new_sku})
+
+            var_url = f"{item_url}/variations/{vid}"
+            # 1) Endpoint sub-recurso: suele saltearse la validación del padre.
+            try:
+                return self._do_put(var_url, {"attributes": attrs})
             except HTTPError as e:
-                first_err = self._read_err_body(e)
-                if not (e.code == 400 and "item.pictures.max" in first_err):
+                err_body = self._read_err_body(e)
+                if not (e.code == 400 and "item.pictures.max" in err_body):
                     raise HTTPError(
                         e.url, e.code, e.reason, e.headers,
-                        io.BytesIO(first_err.encode("utf-8")),
+                        io.BytesIO(err_body.encode("utf-8")),
                     )
-            # 2) Fallback: PUT al item con variations array.
+
+            # 2) Fallback: PUT al item con la variación completa.
             try:
                 return self._do_put(
                     item_url,
-                    {
-                        "variations": [
-                            {
-                                "id": int(variation_id),
-                                "attributes": [
-                                    {"id": "SELLER_SKU", "value_name": new_sku}
-                                ],
-                            }
-                        ]
-                    },
+                    {"variations": [{"id": vid, "attributes": attrs}]},
                 )
             except HTTPError as e:
                 body_text = self._read_err_body(e)
@@ -592,6 +609,15 @@ class VentasApp:
                 e.url, e.code, e.reason, e.headers,
                 io.BytesIO(body_text.encode("utf-8")),
             )
+
+    def _get_item(self, item_id: str) -> dict:
+        url = f"https://api.mercadolibre.com/items/{item_id}"
+        req = Request(
+            url,
+            headers={"Authorization": f"Bearer {self.auth.access_token}"},
+        )
+        with urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
 
     def _read_err_body(self, e: HTTPError) -> str:
         try:
@@ -652,27 +678,35 @@ class VentasApp:
         threading.Thread(target=worker, daemon=True).start()
 
     def _extract_sku_from_item(self, item_data: dict, variation_id) -> str:
-        # Si es variación, buscar la variación específica.
+        # Si es variación, buscar la variación específica. Prioridad: el atributo
+        # SELLER_SKU es la fuente canónica que coincide con lo que reporta /orders
+        # y lo que muestra ML. El campo .seller_sku es un alias que puede quedar
+        # desincronizado.
         if variation_id:
+            try:
+                vid = int(variation_id)
+            except (TypeError, ValueError):
+                vid = variation_id
             for v in item_data.get("variations") or []:
-                if v.get("id") == variation_id:
-                    sku = v.get("seller_sku")
-                    if sku:
-                        return str(sku)
+                if v.get("id") == vid:
                     for attr in v.get("attributes") or []:
                         if (attr.get("id") or "").upper() == "SELLER_SKU":
                             val = attr.get("value_name")
                             if val:
                                 return str(val)
-        # Item sin variación o no encontrada.
-        sku = item_data.get("seller_sku") or item_data.get("seller_custom_field")
-        if sku:
-            return str(sku)
+                    sku = v.get("seller_sku")
+                    if sku:
+                        return str(sku)
+        # Item sin variación o no encontrada: atributo primero, luego campos
+        # de top-level.
         for attr in item_data.get("attributes") or []:
             if (attr.get("id") or "").upper() == "SELLER_SKU":
                 val = attr.get("value_name")
                 if val:
                     return str(val)
+        sku = item_data.get("seller_sku") or item_data.get("seller_custom_field")
+        if sku:
+            return str(sku)
         return ""
 
     def _on_leaf_refreshed(self, leaf_id: str, new_sku: str):
