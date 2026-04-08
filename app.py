@@ -456,7 +456,7 @@ class VentasApp:
         # Usamos /activities?q=ID porque /activities/detail/{id} requiere un hash
         # purchase_v3-{...} impredecible que solo conoce el frontend de MP.
         url = f"https://www.mercadopago.com.ar/activities?q={order_id}"
-        webbrowser.open(url)
+        self._open_url(url)
         return "break"
 
     def _cargar_productos_async(self):
@@ -616,7 +616,7 @@ class VentasApp:
             url = f"https://articulo.mercadolibre.com.ar/{item_id[:3]}-{item_id[3:]}"
         else:
             url = f"https://articulo.mercadolibre.com.ar/{item_id}"
-        webbrowser.open(url)
+        self._open_url(url)
         self._flash_status(f"Abriendo publicación {item_id}")
         return "break"
 
@@ -628,7 +628,7 @@ class VentasApp:
         if not order_id:
             return "break"
         url = f"https://www.mercadolibre.com.ar/ventas/{order_id}/detalle"
-        webbrowser.open(url)
+        self._open_url(url)
         self._flash_status(f"Abriendo venta {order_id}")
         return "break"
 
@@ -1050,6 +1050,25 @@ class VentasApp:
         title = values[4]
         self._set_clipboard(title)
         self._flash_status("Título copiado ✓")
+
+    def _open_url(self, url: str):
+        """Abre una URL. En WSL usa cmd.exe /c start (browser default de
+        Windows, típicamente Chrome); en Linux nativo usa webbrowser.open
+        (que respeta xdg-open / BROWSER, típicamente Brave/Firefox)."""
+        if _IS_WSL:
+            try:
+                import subprocess
+                # cmd.exe /c start "" <url> — comillas vacías son el title
+                subprocess.run(
+                    ["cmd.exe", "/c", "start", "", url],
+                    check=True,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                return
+            except (OSError, subprocess.CalledProcessError):
+                pass  # fallback a webbrowser
+        webbrowser.open(url)
 
     def _set_clipboard(self, text: str):
         """Copia al clipboard. En WSL usa clip.exe (clipboard de Windows);
