@@ -11,6 +11,10 @@ from datetime import datetime
 from pathlib import Path
 from tkinter import filedialog, font as tkfont
 from tkinter import messagebox, ttk
+
+from PIL import Image, ImageTk
+
+import productos_lookup
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -136,6 +140,7 @@ class VentasApp:
         self.day_total: dict = {}  # "DD/MM/YYYY" -> float
 
         self._build_ui()
+        self._cargar_productos_async()
         self.refresh()
 
     def _build_ui(self):
@@ -162,8 +167,15 @@ class VentasApp:
         container = ttk.Frame(self.root, padding=10)
         container.pack(fill="both", expand=True)
 
-        tree_frame = ttk.Frame(container)
-        tree_frame.pack(fill="both", expand=True)
+        paned = ttk.PanedWindow(container, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        tree_frame = ttk.Frame(paned)
+        paned.add(tree_frame, weight=3)
+
+        self.detail_frame = ttk.Frame(paned, padding=(10, 4))
+        paned.add(self.detail_frame, weight=1)
+        self._build_detail_panel()
 
         columns = ("check", "fecha", "sku", "cant", "producto", "precio", "subtotal")
         self.tree = ttk.Treeview(
@@ -193,6 +205,8 @@ class VentasApp:
         self.tree.bind("<Double-Button-1>", self._on_double_click)
         self.tree.bind("<Control-Button-1>", self._on_ctrl_click)
         self.tree.bind("<Shift-Button-1>", self._on_shift_click)
+        self.tree.bind("<<TreeviewSelect>>", self._on_select)
+        self.tree.bind("<Alt-Button-1>", self._on_alt_click)
 
         self._hint_active = None  # "ctrl" / "shift" / None
         self._status_before_hint = ""
@@ -207,7 +221,13 @@ class VentasApp:
 
         self.context_menu = tk.Menu(self.tree, tearoff=0)
         self.context_menu.add_command(
+            label="Copiar SKU", command=self._copy_clicked_sku
+        )
+        self.context_menu.add_command(
             label="Copiar título", command=self._copy_clicked_title
+        )
+        self.context_menu.add_command(
+            label="Copiar ID publicación", command=self._copy_clicked_item_id
         )
         self.context_menu.add_command(
             label="Copiar selección (WhatsApp)",
@@ -247,6 +267,204 @@ class VentasApp:
             bottom, text="Exportar Excel", command=self.export_excel
         )
         self.btn_export.pack(side="right", padx=(0, 6))
+
+    def _build_detail_panel(self):
+        ttk.Label(
+            self.detail_frame,
+            text="Producto",
+            font=("TkDefaultFont", 12, "bold"),
+        ).pack(anchor="w", pady=(0, 8))
+
+        self.detail_status_var = tk.StringVar(value="Seleccioná una venta")
+        self.detail_status_lbl = ttk.Label(
+            self.detail_frame,
+            textvariable=self.detail_status_var,
+            foreground="#888",
+            wraplength=240,
+            justify="left",
+        )
+        self.detail_status_lbl.pack(anchor="w", pady=(0, 8))
+
+        ttk.Label(
+            self.detail_frame,
+            text="Etiquetas",
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(anchor="w", pady=(8, 4))
+
+        self.detail_tags_frame = ttk.Frame(self.detail_frame)
+        self.detail_tags_frame.pack(fill="x", anchor="w")
+
+        ttk.Separator(self.detail_frame, orient="horizontal").pack(
+            fill="x", pady=(12, 8)
+        )
+
+        ttk.Label(
+            self.detail_frame,
+            text="Cobro Mercado Pago",
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+
+        self.detail_payment_frame = ttk.Frame(self.detail_frame)
+        self.detail_payment_frame.pack(fill="x", anchor="w")
+
+        self.detail_payment_hint = ttk.Label(
+            self.detail_frame,
+            text="Alt + click en la fila → abrir en MP",
+            foreground="#888",
+            font=("TkDefaultFont", 9, "italic"),
+        )
+        self.detail_payment_hint.pack(anchor="w", pady=(8, 0))
+
+    def _on_select(self, _event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        leaf_id = sel[0]
+        info = self.leaf_to_item.get(leaf_id)
+        if not info:
+            # Es una fila de día, no una venta
+            self._update_detail(None, None, None)
+            return
+        sku = info.get("sku") or ""
+        producto = productos_lookup.get(sku) if sku else None
+        self._update_detail(sku, producto, info)
+
+    def _update_detail(self, sku: str | None, producto: dict | None, info: dict | None):
+        # Limpiar chips anteriores
+        for w in self.detail_tags_frame.winfo_children():
+            w.destroy()
+        for w in self.detail_payment_frame.winfo_children():
+            w.destroy()
+
+        self._render_payment(info)
+
+        if sku is None:
+            self.detail_status_var.set("Seleccioná una venta")
+            self.detail_status_lbl.configure(foreground="#888")
+            return
+
+        if not productos_lookup.loaded():
+            self.detail_status_var.set("Cargando productos…")
+            self.detail_status_lbl.configure(foreground="#888")
+            return
+
+        if not sku:
+            self.detail_status_var.set("⚠️ Esta venta no tiene SKU")
+            self.detail_status_lbl.configure(foreground="#c0392b")
+            return
+
+        if not producto:
+            self.detail_status_var.set(
+                f"⚠️ SKU {sku} no encontrado en gestor-productos"
+            )
+            self.detail_status_lbl.configure(foreground="#c0392b")
+            return
+
+        nombre = producto.get("nombre") or ""
+        self.detail_status_var.set(f"{sku}\n{nombre}")
+        self.detail_status_lbl.configure(foreground="#333")
+
+        etiquetas_raw = producto.get("etiquetas") or ""
+        etiquetas = [e.strip() for e in etiquetas_raw.split(",") if e.strip()]
+        if not etiquetas:
+            ttk.Label(
+                self.detail_tags_frame,
+                text="(sin etiquetas)",
+                foreground="#888",
+            ).pack(anchor="w")
+            return
+        for et in etiquetas:
+            chip = tk.Label(
+                self.detail_tags_frame,
+                text=et,
+                background="#dce6f0",
+                foreground="#1a3a5c",
+                padx=8,
+                pady=2,
+                borderwidth=0,
+            )
+            chip.pack(anchor="w", pady=2)
+
+    def _render_payment(self, info: dict | None):
+        if not info or info.get("payment_id") is None:
+            ttk.Label(
+                self.detail_payment_frame,
+                text="(sin datos de pago)",
+                foreground="#888",
+            ).pack(anchor="w")
+            return
+
+        rows = [
+            ("Bruto", info.get("total_amount") or 0, "#1a3a5c"),
+            ("Comisión ML", -(info.get("sale_fee") or 0), "#c0392b"),
+        ]
+        if info.get("shipping_cost"):
+            rows.append(("Envío", -(info.get("shipping_cost") or 0), "#c0392b"))
+        if info.get("taxes_amount"):
+            rows.append(("Impuestos", -(info.get("taxes_amount") or 0), "#c0392b"))
+        if info.get("coupon_amount"):
+            rows.append(("Cupón", -(info.get("coupon_amount") or 0), "#c0392b"))
+        rows.append(("Neto", info.get("neto") or 0, "#1e7a1e"))
+
+        for label, value, color in rows:
+            row = ttk.Frame(self.detail_payment_frame)
+            row.pack(fill="x", anchor="w", pady=1)
+            is_total = label in ("Bruto", "Neto")
+            font = ("TkDefaultFont", 10, "bold") if is_total else ("TkDefaultFont", 10)
+            ttk.Label(row, text=label, font=font).pack(side="left")
+            tk.Label(
+                row,
+                text=format_price(value),
+                foreground=color,
+                font=font,
+            ).pack(side="right")
+
+        method = info.get("payment_method") or ""
+        if method:
+            ttk.Label(
+                self.detail_payment_frame,
+                text=f"Método: {method}",
+                foreground="#888",
+                font=("TkDefaultFont", 9),
+            ).pack(anchor="w", pady=(6, 0))
+
+        ttk.Label(
+            self.detail_payment_frame,
+            text=f"Pago #{info.get('payment_id')}",
+            foreground="#888",
+            font=("TkDefaultFont", 9),
+        ).pack(anchor="w")
+
+    def _on_alt_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        order_id = self.row_to_order.get(row)
+        if not order_id:
+            return
+        # MP busca por order_id de ML y muestra el cobro asociado.
+        # Usamos /activities?q=ID porque /activities/detail/{id} requiere un hash
+        # purchase_v3-{...} impredecible que solo conoce el frontend de MP.
+        url = f"https://www.mercadopago.com.ar/activities?q={order_id}"
+        webbrowser.open(url)
+        return "break"
+
+    def _cargar_productos_async(self):
+        def worker():
+            try:
+                n = productos_lookup.cargar()
+                self.root.after(0, lambda: self._on_productos_cargados(n, None))
+            except Exception as e:
+                self.root.after(0, lambda: self._on_productos_cargados(0, str(e)))
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_productos_cargados(self, n: int, error: str | None):
+        if error:
+            self.detail_status_var.set(f"⚠️ Error cargando productos:\n{error}")
+            self.detail_status_lbl.configure(foreground="#c0392b")
+            return
+        # Refrescar el detalle si ya hay una fila seleccionada
+        self._on_select()
 
     def _all_leaves(self) -> list:
         leaves = []
@@ -369,6 +587,8 @@ class VentasApp:
         is_leaf = bool(row) and self.tree.parent(row) != ""
         leaf_state = "normal" if is_leaf else "disabled"
         self.context_menu.entryconfig("Copiar título", state=leaf_state)
+        self.context_menu.entryconfig("Copiar SKU", state=leaf_state)
+        self.context_menu.entryconfig("Copiar ID publicación", state=leaf_state)
         self.context_menu.entryconfig("Refrescar fila", state=leaf_state)
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.focus_set()
@@ -690,6 +910,9 @@ class VentasApp:
         row = self._right_clicked_row
         if not row or self.tree.parent(row) == "":
             return
+        # Recargamos también el cache de productos por si el usuario editó
+        # etiquetas en gestor-productos.
+        self._cargar_productos_async()
         self._refresh_leaf(row)
 
     def _refresh_leaf(self, leaf_id: str):
@@ -811,14 +1034,44 @@ class VentasApp:
         if not row or self.tree.parent(row) == "":
             return
         values = self.tree.item(row, "values")
-        # values = (check, time, sku, title, price)
-        if len(values) < 4:
+        # values = (check, time, sku, cant, producto, precio, subtotal)
+        if len(values) < 5:
             return
-        title = values[3]
+        title = values[4]
         self.root.clipboard_clear()
         self.root.clipboard_append(title)
         self.root.update()
         self._flash_status("Título copiado ✓")
+
+    def _copy_clicked_item_id(self):
+        row = self._right_clicked_row
+        if not row or self.tree.parent(row) == "":
+            return
+        info = self.leaf_to_item.get(row) or {}
+        item_id = info.get("item_id") or ""
+        if not item_id:
+            self._flash_status("Esta venta no tiene ID de publicación")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(item_id)
+        self.root.update()
+        self._flash_status("ID publicación copiado ✓")
+
+    def _copy_clicked_sku(self):
+        row = self._right_clicked_row
+        if not row or self.tree.parent(row) == "":
+            return
+        values = self.tree.item(row, "values")
+        if len(values) < 3:
+            return
+        sku = values[2] or ""
+        if not sku:
+            self._flash_status("Esta venta no tiene SKU")
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(sku)
+        self.root.update()
+        self._flash_status("SKU copiado ✓")
 
     def _collect_selected(self):
         """Devuelve (ordered_days, days_dict, grand_total, count). Lee del Treeview."""
@@ -1055,6 +1308,7 @@ class VentasApp:
         self.day_total.clear()
         self.offset = 0
         self.selected_ids = load_selections()
+        self._cargar_productos_async()
         self._fetch_async(append=False)
 
     def load_more(self):
@@ -1137,6 +1391,33 @@ class VentasApp:
             )
             self.row_to_order[leaf_id] = order_id
             self.row_base[leaf_id] = base
+            # Datos de pago / comisiones para el panel de detalle
+            payments = order.get("payments") or []
+            first_payment = payments[0] if payments else {}
+            try:
+                sale_fee_unit = float(first.get("sale_fee") or 0)
+            except (TypeError, ValueError):
+                sale_fee_unit = 0.0
+            sale_fee_total = sale_fee_unit * quantity
+            try:
+                shipping_cost_num = float(order.get("shipping_cost") or 0)
+            except (TypeError, ValueError):
+                shipping_cost_num = 0.0
+            taxes = order.get("taxes") or {}
+            try:
+                taxes_amount = float(taxes.get("amount") or 0)
+            except (TypeError, ValueError):
+                taxes_amount = 0.0
+            try:
+                coupon_amount = float(first_payment.get("coupon_amount") or 0)
+            except (TypeError, ValueError):
+                coupon_amount = 0.0
+            try:
+                total_amount = float(order.get("total_amount") or line_total)
+            except (TypeError, ValueError):
+                total_amount = line_total
+            neto = total_amount - sale_fee_total - shipping_cost_num - taxes_amount - coupon_amount
+
             self.leaf_to_item[leaf_id] = {
                 "item_id": item.get("id", ""),
                 "variation_id": item.get("variation_id"),
@@ -1145,6 +1426,14 @@ class VentasApp:
                 "quantity": quantity,
                 "unit_price": unit_price_num,
                 "line_total": line_total,
+                "payment_id": first_payment.get("id"),
+                "payment_method": first_payment.get("payment_method_id"),
+                "total_amount": total_amount,
+                "sale_fee": sale_fee_total,
+                "shipping_cost": shipping_cost_num,
+                "taxes_amount": taxes_amount,
+                "coupon_amount": coupon_amount,
+                "neto": neto,
             }
 
             self.day_count[day_key] = self.day_count.get(day_key, 0) + 1
@@ -1266,7 +1555,16 @@ class VentasApp:
 
 
 def main():
-    root = tk.Tk()
+    root = tk.Tk(className="ventas-ml")
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ventas-ml-icon.png")
+    if os.path.exists(icon_path):
+        icon_img = Image.open(icon_path)
+        icon_sizes = []
+        for size in (16, 32, 48, 64, 128, 256):
+            resized = icon_img.resize((size, size), Image.LANCZOS)
+            icon_sizes.append(ImageTk.PhotoImage(resized))
+        root.tk.call("wm", "iconphoto", root._w, "-default", *icon_sizes)
+        root._icon_refs = icon_sizes  # evitar GC
     VentasApp(root)
     root.mainloop()
 
