@@ -15,6 +15,16 @@ from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 
 import productos_lookup
+
+# WSL no sincroniza el clipboard de Tk (X11/WSLg) con el de Windows.
+# Si estamos en WSL usamos clip.exe directo para que Ctrl+V funcione en apps Windows.
+def _is_wsl() -> bool:
+    try:
+        return "microsoft" in Path("/proc/version").read_text().lower()
+    except OSError:
+        return False
+
+_IS_WSL = _is_wsl()
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -1038,10 +1048,26 @@ class VentasApp:
         if len(values) < 5:
             return
         title = values[4]
-        self.root.clipboard_clear()
-        self.root.clipboard_append(title)
-        self.root.update()
+        self._set_clipboard(title)
         self._flash_status("Título copiado ✓")
+
+    def _set_clipboard(self, text: str):
+        """Copia al clipboard. En WSL usa clip.exe (clipboard de Windows);
+        en Linux nativo usa el clipboard de Tk."""
+        if _IS_WSL:
+            try:
+                import subprocess
+                subprocess.run(
+                    ["clip.exe"],
+                    input=text.encode("utf-16le"),
+                    check=True,
+                )
+                return
+            except (OSError, subprocess.CalledProcessError):
+                pass  # fallback al clipboard de Tk
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.root.update()
 
     def _copy_clicked_item_id(self):
         row = self._right_clicked_row
@@ -1052,9 +1078,7 @@ class VentasApp:
         if not item_id:
             self._flash_status("Esta venta no tiene ID de publicación")
             return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(item_id)
-        self.root.update()
+        self._set_clipboard(item_id)
         self._flash_status("ID publicación copiado ✓")
 
     def _copy_clicked_sku(self):
@@ -1068,9 +1092,7 @@ class VentasApp:
         if not sku:
             self._flash_status("Esta venta no tiene SKU")
             return
-        self.root.clipboard_clear()
-        self.root.clipboard_append(sku)
-        self.root.update()
+        self._set_clipboard(sku)
         self._flash_status("SKU copiado ✓")
 
     def _collect_selected(self):
@@ -1128,9 +1150,7 @@ class VentasApp:
         lines.append(f"*Total: {format_price(grand_total)}*")
         text = "\n".join(lines)
 
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        self.root.update()  # mantener en clipboard tras cerrar
+        self._set_clipboard(text)
         self._flash_status(f"Copiado al portapapeles ✓ ({total_count} ventas)")
 
     def export_excel(self):
