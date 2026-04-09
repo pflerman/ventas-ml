@@ -8,7 +8,7 @@ Estructura del JSON:
 {
     "checks":             ["order_id1", ...],            # ventas marcadas
     "notas":              {"order_id": "texto"},         # nota libre por venta
-    "fob":                {"SKU": {"precio": 12.5, "mult": 1}},
+    "fob":                {"SKU": {"precio": 12.5, "mult": 1, "markup": 1.4}},
     "etiquetas_catalogo": ["ordenador", "blanco", ...],  # valores permitidos
     "etiquetas_por_sku":  {"SKU": ["ordenador", ...]},   # asignaciones
     "neto_manual":        {"order_id": 12345.67},        # neto MP cargado a mano
@@ -166,6 +166,42 @@ def set_multiplicador(sku: str, valor: int) -> None:
             f"No hay precio FOB cargado para {sku}. Cargá el FOB primero."
         )
     entry["mult"] = int(valor)
+    _save()
+
+
+def get_markup(sku: str) -> float | None:
+    """Markup de Andrés para un SKU. None si no hay override (cae al default
+    GANANCIA_HERMANO_MULT en el caller)."""
+    if not sku:
+        return None
+    entry = _data["fob"].get(sku) or {}
+    val = entry.get("markup")
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def set_markup(sku: str, valor: float | None) -> None:
+    """Persiste el markup de Andrés para un SKU. Si valor es None, borra el
+    override (vuelve al default). Requiere que ya exista FOB."""
+    if not sku:
+        raise ValueError("SKU vacío")
+    entry = _data["fob"].get(sku)
+    if not entry or not entry.get("precio"):
+        raise ValueError(
+            f"No hay precio FOB cargado para {sku}. Cargá el FOB primero."
+        )
+    if valor is None:
+        if "markup" not in entry:
+            return
+        entry.pop("markup", None)
+    else:
+        if valor < 1:
+            raise ValueError("El markup debe ser ≥ 1")
+        entry["markup"] = float(valor)
     _save()
 
 

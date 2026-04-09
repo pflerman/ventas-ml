@@ -502,6 +502,19 @@ class VentasApp:
 
         ttk.Label(
             self.detail_frame,
+            text="Ganancia Andrés",
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+
+        self.detail_andres_frame = ttk.Frame(self.detail_frame)
+        self.detail_andres_frame.pack(fill="x", anchor="w")
+
+        ttk.Separator(self.detail_frame, orient="horizontal").pack(
+            fill="x", pady=(12, 8)
+        )
+
+        ttk.Label(
+            self.detail_frame,
             text="Cobro Mercado Pago",
             font=("TkDefaultFont", 10, "bold"),
         ).pack(anchor="w", pady=(0, 4))
@@ -567,11 +580,23 @@ class VentasApp:
         ttk.Separator(self.detail_frame, orient="horizontal").pack(
             fill="x", pady=(16, 8)
         )
+        botones_frame = ttk.Frame(self.detail_frame)
+        botones_frame.pack(fill="x", anchor="w")
         ttk.Button(
-            self.detail_frame,
+            botones_frame,
             text="✨ Frase del día ✨",
             command=self._open_frase_modal,
-        ).pack(anchor="w")
+        ).pack(side="left")
+        ttk.Button(
+            botones_frame,
+            text="📋 Copiar informe",
+            command=self._copy_informe_wasap,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Button(
+            botones_frame,
+            text="📄 Copiar informe lite",
+            command=self._copy_informe_lite,
+        ).pack(side="left", padx=(8, 0))
 
     def _on_select(self, _event=None):
         sel = self.tree.selection()
@@ -600,12 +625,19 @@ class VentasApp:
             w.destroy()
         for w in self.detail_costo_frame.winfo_children():
             w.destroy()
+        for w in self.detail_andres_frame.winfo_children():
+            w.destroy()
         for w in self.detail_ganancia_frame.winfo_children():
             w.destroy()
 
-        # Reset del costo unitario calculado (lo setea _render_costo si puede).
+        # Reset de los costos calculados (los setea _render_costo si puede).
         self._last_costo_unitario = None
+        self._last_andres_pago_unitario = None
+        self._last_pago_per_unit = None
+        self._last_cobro_per_unit = None
+        self._last_pack_mult = None
         self._render_costo(sku, info)
+        self._render_andres(info)
         self._render_payment(info)
         self._render_ganancia(info)
 
@@ -746,6 +778,8 @@ class VentasApp:
             side="right", padx=(0, 6)
         )
         entry.bind("<Return>", lambda _e: do_save())
+        win.bind("<Return>", lambda _e: do_save())
+        win.bind("<KP_Enter>", lambda _e: do_save())
         win.bind("<Escape>", lambda _e: win.destroy())
 
         win.update_idletasks()
@@ -965,6 +999,8 @@ class VentasApp:
             side="right", padx=(0, 6)
         )
         entry.bind("<Return>", lambda _e: do_save())
+        win.bind("<Return>", lambda _e: do_save())
+        win.bind("<KP_Enter>", lambda _e: do_save())
         win.bind("<Escape>", lambda _e: win.destroy())
 
         win.update_idletasks()
@@ -1047,6 +1083,8 @@ class VentasApp:
             side="right", padx=(0, 6)
         )
         entry.bind("<Return>", lambda _e: do_save())
+        win.bind("<Return>", lambda _e: do_save())
+        win.bind("<KP_Enter>", lambda _e: do_save())
         win.bind("<Escape>", lambda _e: win.destroy())
 
         win.update_idletasks()
@@ -1128,23 +1166,26 @@ class VentasApp:
         #   10-20%  → BAJO      (naranja) rentable pero ajustado
         #   20-30%  → BUENO     (verde)   margen sano de importador
         #   > 30%   → EXCELENTE (violeta) producto ganador
+        def chip_for(pct):
+            if pct < 10:
+                return "MUY BAJO", "#c0392b"
+            elif pct < 20:
+                return "BAJO", "#d35400"
+            elif pct < 30:
+                return "BUENO", "#1e7a1e"
+            else:
+                return "EXCELENTE", "#7d3c98"
+
         total_amount = float((info or {}).get("total_amount") or 0)
         if total_amount > 0:
             margen_pct = (ganancia / total_amount) * 100
-            if margen_pct < 10:
-                chip_text, chip_bg = "MUY BAJO", "#c0392b"
-            elif margen_pct < 20:
-                chip_text, chip_bg = "BAJO", "#d35400"
-            elif margen_pct < 30:
-                chip_text, chip_bg = "BUENO", "#1e7a1e"
-            else:
-                chip_text, chip_bg = "EXCELENTE", "#7d3c98"
+            chip_text, chip_bg = chip_for(margen_pct)
 
             margen_row = ttk.Frame(frame)
             margen_row.pack(fill="x", anchor="w", pady=(8, 0))
             ttk.Label(
                 margen_row,
-                text="Margen",
+                text="Margen Pablo",
                 font=("TkDefaultFont", 11, "bold"),
             ).pack(side="left")
             tk.Label(
@@ -1160,6 +1201,89 @@ class VentasApp:
                 background=chip_bg,
                 font=("TkDefaultFont", 9, "bold"),
             ).pack(side="left")
+
+            # Leyenda de niveles (italic gris) — solo se imprime una vez,
+            # debajo del margen de Pablo, porque Andrés usa los mismos.
+            ttk.Label(
+                frame,
+                text="<10 MUY BAJO  ·  10-20 BAJO  ·  20-30 BUENO  ·  >30 EXCELENTE",
+                foreground="#888",
+                font=("TkDefaultFont", 9, "italic"),
+            ).pack(anchor="w", pady=(1, 0))
+
+            # Sugerencia de precio para llegar al próximo tier (BUENO/EXCELENTE).
+            # Asume que la relación neto/bruto se mantiene constante cuando se
+            # cambia el precio (los fees de MP escalan ~lineal). Es una
+            # aproximación: el envío manual fijo introduce algo de error pero
+            # alcanza para una sugerencia útil.
+            def precio_pablo_para(target_pct):
+                ratio = neto / total_amount
+                denom = ratio - target_pct / 100
+                if denom <= 0:
+                    return None
+                return costo_total / denom
+
+            partes_p = []
+            if margen_pct < 20:
+                p = precio_pablo_para(20)
+                if p is not None:
+                    partes_p.append(f"BUENO vendé a {format_price(p)}")
+            if margen_pct < 30:
+                p = precio_pablo_para(30)
+                if p is not None:
+                    partes_p.append(f"EXCELENTE vendé a {format_price(p)}")
+            if partes_p:
+                ttk.Label(
+                    frame,
+                    text="Para " + "  ·  Para ".join(partes_p),
+                    foreground="#888",
+                    font=("TkDefaultFont", 9, "italic"),
+                ).pack(anchor="w")
+
+        # Margen de Andrés sobre su costo (= markup − 1). Va acá pegado al
+        # margen de Pablo para que se vean uno arriba del otro y sea fácil
+        # comparar la rentabilidad de los dos.
+        sku = (info or {}).get("sku") if info else None
+        markup_a = local_store.get_markup(sku) if sku else None
+        if markup_a is None:
+            markup_a = GANANCIA_HERMANO_MULT
+        margen_a_pct = (markup_a - 1) * 100
+        chip_text_a, chip_bg_a = chip_for(margen_a_pct)
+
+        margen_a_row = ttk.Frame(frame)
+        margen_a_row.pack(fill="x", anchor="w", pady=(6, 0))
+        ttk.Label(
+            margen_a_row,
+            text="Margen Andrés",
+            font=("TkDefaultFont", 11, "bold"),
+        ).pack(side="left")
+        tk.Label(
+            margen_a_row,
+            text=f"{margen_a_pct:.1f}%",
+            foreground="#1a3a5c",
+            font=("TkDefaultFont", 12, "bold"),
+        ).pack(side="left", padx=(8, 8))
+        tk.Label(
+            margen_a_row,
+            text=f"  {chip_text_a}  ",
+            foreground="white",
+            background=chip_bg_a,
+            font=("TkDefaultFont", 9, "bold"),
+        ).pack(side="left")
+
+        # Sugerencia de markup para Andrés. Trivial: target_pct% → 1 + t/100.
+        partes_a = []
+        if margen_a_pct < 20:
+            partes_a.append("BUENO subí markup a 1.20")
+        if margen_a_pct < 30:
+            partes_a.append("EXCELENTE subí markup a 1.30")
+        if partes_a:
+            ttk.Label(
+                frame,
+                text="Para " + "  ·  Para ".join(partes_a),
+                foreground="#888",
+                font=("TkDefaultFont", 9, "italic"),
+            ).pack(anchor="w", pady=(1, 0))
 
     # ────────────── Notas por venta ──────────────
 
@@ -1292,20 +1416,49 @@ class VentasApp:
                 ).pack(anchor="w")
             return
 
-        costo_pesos = nacionalizado_usd * cot
-        precio_final = costo_pesos * GANANCIA_HERMANO_MULT
-        # Guardar el costo unitario por pack para que _render_ganancia lo use.
-        self._last_costo_unitario = precio_final
+        # ── Cálculo paso a paso, todo por unidad PRIMERO ──
+        # Construimos los valores per-unit (1 sola unidad física), después
+        # multiplicamos por el pack y al final por la cantidad de la venta.
+        # Markup de Andrés: por defecto GANANCIA_HERMANO_MULT, pero se puede
+        # override por SKU (persistido en data.json).
+        markup = local_store.get_markup(sku)
+        if markup is None:
+            markup = GANANCIA_HERMANO_MULT
+        nac_usd_unit = fob * NACIONALIZACION_MULT          # USD por unidad
+        pesos_unit = nac_usd_unit * cot                     # $ por unidad
+        andres_unit = pesos_unit * markup                   # $ por unidad con markup
 
-        rows = [
-            (f"FOB unitario", f"USD {fob:,.2f}", "#1a3a5c"),
-            (f"FOB total (×{mult})", f"USD {fob_total:,.2f}", "#1a3a5c"),
+        # Por pack (= por una venta de 1 cantidad). El multiplicador del pack
+        # se aplica acá, no antes.
+        andres_pack = andres_unit * mult
+        pago_pack = pesos_unit * mult  # lo que Andrés pagó en China por pack
+
+        # Cantidad de la venta (cuántos packs se vendieron en esta orden).
+        try:
+            quantity = int((info or {}).get("quantity") or 1)
+        except (TypeError, ValueError):
+            quantity = 1
+        andres_total = andres_pack * quantity
+
+        # Variables para el resto de la app. Mantenemos la semántica per-pack
+        # porque _render_ganancia y _calcular_totales_seleccionados ya esperan
+        # eso (después multiplican por quantity).
+        self._last_costo_unitario = andres_pack
+        self._last_andres_pago_unitario = pago_pack
+        # Valores per-unidad real (1 sola unidad física) + mult del pack para
+        # que _render_andres pueda armar el desglose paso a paso (individual →
+        # pack → total venta) en sintonía con esta sección.
+        self._last_pago_per_unit = pesos_unit
+        self._last_cobro_per_unit = andres_unit
+        self._last_pack_mult = mult
+
+        # ── Render: paso a paso, per-unidad ──
+        rows_unit = [
+            ("FOB unitario", f"USD {fob:,.2f}", "#1a3a5c"),
             (f"Nacionalizado (×{NACIONALIZACION_MULT})",
-             f"USD {nacionalizado_usd:,.2f}", "#1a3a5c"),
-            (f"En pesos (×${cot:,.0f})",
-             format_price(costo_pesos), "#1a3a5c"),
+             f"USD {nac_usd_unit:,.2f}", "#1a3a5c"),
         ]
-        for label, value, color in rows:
+        for label, value, color in rows_unit:
             row = ttk.Frame(frame)
             row.pack(fill="x", anchor="w", pady=1)
             ttk.Label(row, text=label, font=("TkDefaultFont", 10)).pack(side="left")
@@ -1313,42 +1466,265 @@ class VentasApp:
                 row, text=value, foreground=color, font=("TkDefaultFont", 10)
             ).pack(side="right")
 
-        # ── Pagar a Andrés: individual + total (×cant). Si cant=1 son iguales. ──
+        # En pesos: misma estructura pero con chip "Costo individual" al lado
+        # del label, porque es el costo real per-unidad sin markup todavía.
+        row_pesos = ttk.Frame(frame)
+        row_pesos.pack(fill="x", anchor="w", pady=1)
+        ttk.Label(
+            row_pesos,
+            text=f"En pesos (×${cot:,.0f})",
+            font=("TkDefaultFont", 10),
+        ).pack(side="left")
+        tk.Label(
+            row_pesos,
+            text="  Costo individual  ",
+            foreground="white",
+            background="#1a3a5c",
+            font=("TkDefaultFont", 9, "bold"),
+        ).pack(side="left", padx=(6, 0))
+        tk.Label(
+            row_pesos,
+            text=format_price(pesos_unit),
+            foreground="#1a3a5c",
+            font=("TkDefaultFont", 10),
+        ).pack(side="right")
+
+        # Misma línea pero × multiplicador del pack, solo si mult > 1.
+        # (Si es por unidad, sería duplicar la fila de arriba.)
+        if mult > 1:
+            row_pack_pesos = ttk.Frame(frame)
+            row_pack_pesos.pack(fill="x", anchor="w", pady=1)
+            ttk.Label(
+                row_pack_pesos,
+                text=f"En pesos (×${cot:,.0f})",
+                font=("TkDefaultFont", 10),
+            ).pack(side="left")
+            tk.Label(
+                row_pack_pesos,
+                text="  Costo x Pack  ",
+                foreground="white",
+                background="#1a3a5c",
+                font=("TkDefaultFont", 9, "bold"),
+            ).pack(side="left", padx=(6, 0))
+            tk.Label(
+                row_pack_pesos,
+                text=f"  Pack {mult}  ",
+                foreground="white",
+                background="#7d3c98",
+                font=("TkDefaultFont", 9, "bold"),
+            ).pack(side="left", padx=(4, 0))
+            tk.Label(
+                row_pack_pesos,
+                text=format_price(pesos_unit * mult),
+                foreground="#1a3a5c",
+                font=("TkDefaultFont", 10),
+            ).pack(side="right")
+
+        # Costo total de la venta = costo per pack × cantidad. Solo si > 1.
+        try:
+            qty_for_total = int((info or {}).get("quantity") or 1)
+        except (TypeError, ValueError):
+            qty_for_total = 1
+        if qty_for_total > 1:
+            row_total_pesos = ttk.Frame(frame)
+            row_total_pesos.pack(fill="x", anchor="w", pady=1)
+            ttk.Label(
+                row_total_pesos,
+                text=f"En pesos (×${cot:,.0f})",
+                font=("TkDefaultFont", 10),
+            ).pack(side="left")
+            tk.Label(
+                row_total_pesos,
+                text="  Costo total  ",
+                foreground="white",
+                background="#1a3a5c",
+                font=("TkDefaultFont", 9, "bold"),
+            ).pack(side="left", padx=(6, 0))
+            tk.Label(
+                row_total_pesos,
+                text=f"  {qty_for_total} items  ",
+                foreground="white",
+                background="#7d3c98",
+                font=("TkDefaultFont", 9, "bold"),
+            ).pack(side="left", padx=(4, 0))
+            tk.Label(
+                row_total_pesos,
+                text=format_price(pesos_unit * mult * qty_for_total),
+                foreground="#1a3a5c",
+                font=("TkDefaultFont", 10),
+            ).pack(side="right")
+
+        # Total individual (1 unidad con markup de Andrés).
+        # La línea entera es clickeable → abre modal para editar el markup.
+        # Mostramos el markup sin ceros innecesarios (1.3 no 1.30, 1.4 no 1.40).
+        markup_str = f"{markup:g}"
+        row_ind = ttk.Frame(frame, cursor="hand2")
+        row_ind.pack(fill="x", anchor="w", pady=(4, 1))
+        lbl_ind = tk.Label(
+            row_ind,
+            text="Pagar a Andrés individual:",
+            foreground="#7d3c98",
+            font=("TkDefaultFont", 12, "bold"),
+            cursor="hand2",
+        )
+        lbl_ind.pack(side="left")
+        chip_markup = tk.Label(
+            row_ind,
+            text=f"  $$$ {markup_str} %  ",
+            foreground="white",
+            background="#d35400",
+            font=("TkDefaultFont", 9, "bold"),
+            cursor="hand2",
+        )
+        chip_markup.pack(side="left", padx=(6, 0))
+        val_ind = tk.Label(
+            row_ind,
+            text=format_price(andres_unit),
+            foreground="#7d3c98",
+            font=("TkDefaultFont", 12, "bold", "underline"),
+            cursor="hand2",
+        )
+        val_ind.pack(side="right")
+        for w in (row_ind, lbl_ind, chip_markup, val_ind):
+            w.bind(
+                "<Button-1>",
+                lambda _e, s=sku, t=(info or {}).get("title") or "": self._open_markup_modal(s, t),
+            )
+
+        # ── × multiplicador del pack (solo si > 1) ──
+        if mult > 1:
+            row_pack = ttk.Frame(frame)
+            row_pack.pack(fill="x", anchor="w", pady=(4, 1))
+            tk.Label(
+                row_pack,
+                text="Pagar a Andrés por pack:",
+                foreground="#7d3c98",
+                font=("TkDefaultFont", 12, "bold"),
+            ).pack(side="left")
+            tk.Label(
+                row_pack,
+                text=f"  Pack {mult}  ",
+                foreground="white",
+                background="#d35400",
+                font=("TkDefaultFont", 9, "bold"),
+            ).pack(side="left", padx=(6, 0))
+            tk.Label(
+                row_pack,
+                text=format_price(andres_pack),
+                foreground="#7d3c98",
+                font=("TkDefaultFont", 12, "bold", "underline"),
+            ).pack(side="right")
+
+        # ── × cantidad de la venta (solo si > 1) ──
+        if quantity > 1:
+            row_tot = ttk.Frame(frame)
+            row_tot.pack(fill="x", anchor="w", pady=(4, 1))
+            tk.Label(
+                row_tot,
+                text="Pagar a Andrés total venta:",
+                foreground="#c0392b",
+                font=("TkDefaultFont", 12, "bold"),
+            ).pack(side="left")
+            tk.Label(
+                row_tot,
+                text=f"  {quantity} items  ",
+                foreground="white",
+                background="#d35400",
+                font=("TkDefaultFont", 9, "bold"),
+            ).pack(side="left", padx=(6, 0))
+            tk.Label(
+                row_tot,
+                text=format_price(andres_total),
+                foreground="#c0392b",
+                font=("TkDefaultFont", 12, "bold", "underline"),
+            ).pack(side="right")
+
+    def _render_andres(self, info: dict | None):
+        """Ganancia que se queda Andrés: cobra − paga, con desglose paso a
+        paso (individual → pack → total venta), reusando los valores per-
+        unidad ya calculados en _render_costo.
+
+          Ganancia Andrés individual:  [$$$ X %]    $X   ← (markup−1) × pesos_unit
+          Ganancia Andrés por Pack:    [Pack N]     $X   ← × mult del pack (si > 1)
+          Ganancia Andrés total:       [N items]    $X   ← × cantidad venta (si > 1)
+        """
+        frame = self.detail_andres_frame
+        pago_u = self._last_pago_per_unit
+        cobro_u = self._last_cobro_per_unit
+        mult = self._last_pack_mult or 1
+        if pago_u is None or cobro_u is None:
+            ttk.Label(
+                frame,
+                text="(faltan datos para calcular)",
+                foreground="#888",
+            ).pack(anchor="w")
+            return
+
         try:
             quantity = int((info or {}).get("quantity") or 1)
         except (TypeError, ValueError):
             quantity = 1
-        precio_total = precio_final * quantity
 
-        row_ind = ttk.Frame(frame)
-        row_ind.pack(fill="x", anchor="w", pady=(4, 1))
-        tk.Label(
-            row_ind,
-            text=f"Pagar a Andrés individual (×{GANANCIA_HERMANO_MULT}):",
-            foreground="#7d3c98",
-            font=("TkDefaultFont", 12, "bold"),
-        ).pack(side="left")
-        tk.Label(
-            row_ind,
-            text=format_price(precio_final),
-            foreground="#7d3c98",
-            font=("TkDefaultFont", 12, "bold", "underline"),
-        ).pack(side="right")
+        # Markup específico del SKU para mostrar en el chip "$$$ X %".
+        sku = (info or {}).get("sku") if info else None
+        markup = local_store.get_markup(sku) if sku else None
+        if markup is None:
+            markup = GANANCIA_HERMANO_MULT
+        markup_str = f"{markup:g}"
 
-        row_tot = ttk.Frame(frame)
-        row_tot.pack(fill="x", anchor="w", pady=1)
-        tk.Label(
-            row_tot,
-            text=f"Pagar a Andrés total (×{quantity}):",
-            foreground="#c0392b",
-            font=("TkDefaultFont", 12, "bold"),
-        ).pack(side="left")
-        tk.Label(
-            row_tot,
-            text=format_price(precio_total),
-            foreground="#c0392b",
-            font=("TkDefaultFont", 12, "bold", "underline"),
-        ).pack(side="right")
+        gan_unit = cobro_u - pago_u            # ganancia por unidad
+        gan_pack = gan_unit * mult             # × mult del pack
+        gan_total = gan_pack * quantity        # × cantidad de la venta
+
+        # Paleta nueva para esta sección: chips en teal, líneas en verde
+        # oscuro y la total en rojo (visual hierarchy: el "número grande").
+        chip_bg = "#16a085"
+        line_color_normal = "#117a65"
+        line_color_total = "#c0392b"
+
+        def add_row(label_text: str, chip_text: str, value: float, color: str):
+            row = ttk.Frame(frame)
+            row.pack(fill="x", anchor="w", pady=(4, 1))
+            tk.Label(
+                row,
+                text=label_text,
+                foreground=color,
+                font=("TkDefaultFont", 12, "bold"),
+            ).pack(side="left")
+            tk.Label(
+                row,
+                text=f"  {chip_text}  ",
+                foreground="white",
+                background=chip_bg,
+                font=("TkDefaultFont", 9, "bold"),
+            ).pack(side="left", padx=(6, 0))
+            tk.Label(
+                row,
+                text=format_price(value),
+                foreground=color,
+                font=("TkDefaultFont", 12, "bold", "underline"),
+            ).pack(side="right")
+
+        add_row(
+            "Ganancia Andrés individual:",
+            f"$$$ {markup_str} %",
+            gan_unit,
+            line_color_normal,
+        )
+        if mult > 1:
+            add_row(
+                "Ganancia Andrés por Pack:",
+                f"Pack {mult}",
+                gan_pack,
+                line_color_normal,
+            )
+        if quantity > 1:
+            add_row(
+                "Ganancia Andrés total:",
+                f"{quantity} items",
+                gan_total,
+                line_color_total,
+            )
 
     # ────────────────── Atajos de teclado (F1-F6) ──────────────────
     # Estructura: pequeños URL builders + un helper que devuelve la fila
@@ -1561,6 +1937,8 @@ class VentasApp:
 
         save_btn.configure(command=do_save)
         entry.bind("<Return>", lambda e: do_save())
+        win.bind("<Return>", lambda e: do_save())
+        win.bind("<KP_Enter>", lambda e: do_save())
         win.bind("<Escape>", lambda e: win.destroy())
 
         # Centrar sobre la ventana principal.
@@ -1660,6 +2038,8 @@ class VentasApp:
 
         save_btn.configure(command=do_save)
         entry.bind("<Return>", lambda e: do_save())
+        win.bind("<Return>", lambda e: do_save())
+        win.bind("<KP_Enter>", lambda e: do_save())
         win.bind("<Escape>", lambda e: win.destroy())
 
         win.update_idletasks()
@@ -1672,6 +2052,105 @@ class VentasApp:
         win.destroy()
         self._flash_status(f"Multiplicador guardado para {sku} ✓")
         self._on_select()
+
+    def _open_markup_modal(self, sku: str, title: str):
+        """Modal para editar el markup de Andrés (×N) específico de un SKU.
+        Se persiste en data.json. Si se borra (vacío) o se pone el default,
+        vuelve a usar GANANCIA_HERMANO_MULT (= 1.3) para mantener el JSON limpio."""
+        if not sku:
+            self._flash_status("Seleccioná una venta con SKU primero")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Markup de Andrés")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        frame = ttk.Frame(win, padding=15)
+        frame.pack(fill="both", expand=True)
+
+        if title:
+            ttk.Label(
+                frame,
+                text=title,
+                wraplength=420,
+                font=("TkDefaultFont", 11, "bold"),
+            ).pack(anchor="w", pady=(0, 4))
+        ttk.Label(frame, text=f"SKU: {sku}", foreground="#666").pack(
+            anchor="w", pady=(0, 12)
+        )
+
+        ttk.Label(frame, text="Markup de Andrés:").pack(anchor="w")
+        actual = local_store.get_markup(sku)
+        if actual is None:
+            actual = GANANCIA_HERMANO_MULT
+        markup_var = tk.StringVar(value=f"{actual:g}")
+        entry = ttk.Entry(frame, textvariable=markup_var, width=12)
+        entry.pack(anchor="w", pady=(2, 12))
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        ttk.Label(
+            frame,
+            text=(
+                f"Default {GANANCIA_HERMANO_MULT:g}. Subilo si Andrés te cobra "
+                f"más por este producto. Vacío o {GANANCIA_HERMANO_MULT:g} = default."
+            ),
+            foreground="#888",
+            font=("TkDefaultFont", 9, "italic"),
+            wraplength=380,
+        ).pack(anchor="w", pady=(0, 8))
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+
+        def do_save():
+            # Punto como separador decimal. Acepta coma como tolerancia.
+            raw = markup_var.get().strip().replace(",", ".")
+            if raw == "":
+                new_markup = None  # borra el override
+            else:
+                try:
+                    new_markup = float(raw)
+                except ValueError:
+                    self._flash_status("Valor inválido — debe ser un número ≥ 1")
+                    return
+                if new_markup < 1:
+                    self._flash_status("El markup debe ser ≥ 1")
+                    return
+                # Si volvió al default, borramos el override para mantener JSON limpio.
+                if abs(new_markup - GANANCIA_HERMANO_MULT) < 1e-9:
+                    new_markup = None
+            try:
+                local_store.set_markup(sku, new_markup)
+            except Exception as e:
+                messagebox.showerror(
+                    "Error", f"No se pudo guardar el markup:\n{e}", parent=win
+                )
+                return
+            win.destroy()
+            shown = (
+                f"{GANANCIA_HERMANO_MULT:g} (default)"
+                if new_markup is None
+                else f"{new_markup:g}"
+            )
+            self._flash_status(f"Markup ×{shown} guardado para {sku} ✓")
+            self._on_select()
+            self._update_totales_inline()
+
+        ttk.Button(btns, text="Guardar", command=do_save).pack(side="right")
+        ttk.Button(btns, text="Cancelar", command=win.destroy).pack(
+            side="right", padx=(0, 6)
+        )
+        entry.bind("<Return>", lambda _e: do_save())
+        win.bind("<Return>", lambda _e: do_save())
+        win.bind("<KP_Enter>", lambda _e: do_save())
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
 
     def _open_totales_modal(self):
         totales = self._calcular_totales_seleccionados()
@@ -1836,6 +2315,243 @@ class VentasApp:
             dolar.cargar()
             self.root.after(0, self._on_dolar_cargado)
         threading.Thread(target=worker, daemon=True).start()
+
+    # ────────────── Informe para WhatsApp ──────────────
+
+    def _copy_informe_wasap(self):
+        """Arma un informe explicativo de la venta seleccionada con todos los
+        cálculos y lo copia al portapapeles. Formato WhatsApp (negritas con *,
+        emojis, párrafos cortos). Pensado para mandárselo a Andrés/Pablo y que
+        cualquiera lo entienda sin abrir la app."""
+        sel = self.tree.selection()
+        if not sel:
+            self._flash_status("Seleccioná una venta primero")
+            return
+        leaf_id = sel[0]
+        info = self.leaf_to_item.get(leaf_id)
+        if not info:
+            self._flash_status("Seleccioná una venta (no un día)")
+            return
+        order_id = self.row_to_order.get(leaf_id)
+
+        title = info.get("title") or "(sin título)"
+        sku = info.get("sku") or "(sin SKU)"
+        try:
+            quantity = int(info.get("quantity") or 1)
+        except (TypeError, ValueError):
+            quantity = 1
+        bruto = float(info.get("total_amount") or 0)
+
+        fob = local_store.get_fob(sku) if sku else None
+        mult = local_store.get_multiplicador(sku) if sku else None
+        markup = local_store.get_markup(sku) if sku else None
+        if markup is None:
+            markup = GANANCIA_HERMANO_MULT
+        cot = dolar.get()
+        neto = local_store.get_neto_efectivo(order_id) if order_id else None
+        neto_raw = local_store.get_neto_manual(order_id) if order_id else None
+        envio = local_store.get_shipping_manual(order_id) if order_id else None
+
+        lineas: list[str] = []
+        lineas.append(f"📦 *{title}*")
+        lineas.append(f"🏷️ SKU: `{sku}`")
+        if quantity > 1:
+            lineas.append(f"🛒 Cantidad vendida: *{quantity} unidades*")
+        else:
+            lineas.append("🛒 Cantidad vendida: *1 unidad*")
+        lineas.append(f"💵 Precio publicado: *{format_price(bruto)}*")
+        lineas.append("")
+
+        # ── Costo de importación ──
+        if fob and mult and cot:
+            nac_unit = fob * NACIONALIZACION_MULT
+            pesos_unit = nac_unit * cot
+            andres_unit = pesos_unit * markup
+            pesos_pack = pesos_unit * mult
+            andres_pack = andres_unit * mult
+            pesos_total = pesos_pack * quantity
+            andres_total = andres_pack * quantity
+
+            lineas.append("🇨🇳 *COSTO DE IMPORTACIÓN (lo que pagó Andrés en China)*")
+            lineas.append(f"• FOB unitario: USD {fob:,.2f}")
+            lineas.append(
+                f"• Nacionalizado (×{NACIONALIZACION_MULT}): USD {nac_unit:,.2f}"
+            )
+            lineas.append(
+                f"• En pesos (cotización ${cot:,.0f}): {format_price(pesos_unit)} por unidad"
+            )
+            if mult > 1:
+                lineas.append(
+                    f"• Por pack de {mult}: {format_price(pesos_pack)}"
+                )
+            if quantity > 1:
+                lineas.append(
+                    f"• Total por las {quantity} unidades: *{format_price(pesos_total)}*"
+                )
+            lineas.append("")
+
+            # ── Lo que cobra Andrés a Pablo ──
+            markup_str = f"{markup:g}"
+            lineas.append(
+                f"💰 *LO QUE COBRA ANDRÉS A PABLO* (markup ×{markup_str} = {(markup-1)*100:.0f}%)"
+            )
+            lineas.append(
+                f"• Por unidad: {format_price(andres_unit)}"
+            )
+            if mult > 1:
+                lineas.append(
+                    f"• Por pack de {mult}: {format_price(andres_pack)}"
+                )
+            if quantity > 1:
+                lineas.append(
+                    f"• Total a pagar a Andrés por esta venta: *{format_price(andres_total)}*"
+                )
+            lineas.append("")
+
+            # ── Ganancia de Andrés ──
+            gan_a_unit = andres_unit - pesos_unit
+            gan_a_pack = gan_a_unit * mult
+            gan_a_total = gan_a_pack * quantity
+            margen_a_pct = (markup - 1) * 100
+
+            lineas.append("👨 *GANANCIA DE ANDRÉS*")
+            lineas.append(
+                f"• Por unidad: {format_price(gan_a_unit)}"
+            )
+            if mult > 1:
+                lineas.append(
+                    f"• Por pack de {mult}: {format_price(gan_a_pack)}"
+                )
+            if quantity > 1:
+                lineas.append(
+                    f"• Total de esta venta: *{format_price(gan_a_total)}*"
+                )
+            lineas.append(
+                f"• Margen sobre su costo: *{margen_a_pct:.1f}%*"
+            )
+            lineas.append("")
+
+        # ── Cobro Mercado Pago ──
+        lineas.append("💳 *COBRO EN MERCADO PAGO*")
+        lineas.append(f"• Bruto (precio publicado): {format_price(bruto)}")
+        if neto_raw is not None:
+            lineas.append(
+                f"• Neto MP (después de comisiones): {format_price(neto_raw)}"
+            )
+            if envio:
+                lineas.append(
+                    f"• Envío Flex (lo que pago afuera): -{format_price(envio)}"
+                )
+                lineas.append(
+                    f"• Neto efectivo: *{format_price(neto)}*"
+                )
+        else:
+            lineas.append("• ⚠️ Neto MP todavía no cargado")
+        lineas.append("")
+
+        # ── Ganancia total Pablo ──
+        if (
+            fob and mult and cot and neto is not None
+        ):
+            costo_unit_pack = pesos_unit * mult * markup  # what Pablo paga a Andrés (per pack)
+            costo_total_pablo = costo_unit_pack * quantity
+            ganancia_pablo = float(neto) - costo_total_pablo
+            margen_pct = (
+                (ganancia_pablo / bruto * 100) if bruto > 0 else 0
+            )
+            lineas.append("🎯 *RESULTADO FINAL PABLO*")
+            lineas.append(
+                f"• Le entró (neto efectivo): {format_price(neto)}"
+            )
+            lineas.append(
+                f"• Le pagó a Andrés: -{format_price(costo_total_pablo)}"
+            )
+            signo = "✅" if ganancia_pablo >= 0 else "❌"
+            lineas.append(
+                f"• {signo} *Ganancia neta: {format_price(ganancia_pablo)}*"
+            )
+            lineas.append(
+                f"• Margen sobre el bruto: *{margen_pct:.1f}%*"
+            )
+
+            # Niveles
+            def nivel(pct):
+                if pct < 10:
+                    return "🔴 MUY BAJO"
+                if pct < 20:
+                    return "🟠 BAJO"
+                if pct < 30:
+                    return "🟢 BUENO"
+                return "🟣 EXCELENTE"
+
+            lineas.append(
+                f"• Nivel: {nivel(margen_pct)}"
+            )
+            lineas.append("")
+            lineas.append(
+                "_Niveles: <10% MUY BAJO · 10-20% BAJO · 20-30% BUENO · >30% EXCELENTE_"
+            )
+
+        texto = "\n".join(lineas)
+        self._set_clipboard(texto)
+        self._flash_status("📋 Informe copiado al portapapeles ✓")
+
+    def _copy_informe_lite(self):
+        """Versión resumida del informe: solo título, SKU, cantidad, ganancia
+        Andrés y ganancia Pablo. Pensado para mandar rápido por WhatsApp sin
+        toda la explicación de los cálculos."""
+        sel = self.tree.selection()
+        if not sel:
+            self._flash_status("Seleccioná una venta primero")
+            return
+        leaf_id = sel[0]
+        info = self.leaf_to_item.get(leaf_id)
+        if not info:
+            self._flash_status("Seleccioná una venta (no un día)")
+            return
+        order_id = self.row_to_order.get(leaf_id)
+
+        title = info.get("title") or "(sin título)"
+        sku = info.get("sku") or "(sin SKU)"
+        try:
+            quantity = int(info.get("quantity") or 1)
+        except (TypeError, ValueError):
+            quantity = 1
+
+        fob = local_store.get_fob(sku) if sku else None
+        mult = local_store.get_multiplicador(sku) if sku else None
+        markup = local_store.get_markup(sku) if sku else None
+        if markup is None:
+            markup = GANANCIA_HERMANO_MULT
+        cot = dolar.get()
+        neto = local_store.get_neto_efectivo(order_id) if order_id else None
+
+        lineas: list[str] = []
+        lineas.append(f"📦 *{title}*")
+        lineas.append(f"🏷️ SKU: `{sku}`")
+        unidad_label = "unidad" if quantity == 1 else "unidades"
+        lineas.append(f"🛒 Cantidad vendida: *{quantity} {unidad_label}*")
+        lineas.append("")
+
+        if fob and mult and cot:
+            pesos_unit = fob * NACIONALIZACION_MULT * cot
+            andres_total = pesos_unit * markup * mult * quantity
+            pesos_total = pesos_unit * mult * quantity
+            gan_andres = andres_total - pesos_total
+            lineas.append(f"👨 *Ganancia Andrés:* {format_price(gan_andres)}")
+
+            if neto is not None:
+                gan_pablo = float(neto) - andres_total
+                signo = "✅" if gan_pablo >= 0 else "❌"
+                lineas.append(f"{signo} *Ganancia Pablo:* {format_price(gan_pablo)}")
+            else:
+                lineas.append("⚠️ *Ganancia Pablo:* falta cargar neto MP")
+        else:
+            lineas.append("⚠️ Faltan datos (FOB / multiplicador / dólar) para calcular ganancias")
+
+        texto = "\n".join(lineas)
+        self._set_clipboard(texto)
+        self._flash_status("📄 Informe lite copiado al portapapeles ✓")
 
     # ────────────── Frase del día (modal) ──────────────
     # Tk en Linux no rendea emojis en color con la fuente default. Symbola
@@ -2218,8 +2934,9 @@ class VentasApp:
                 sin_costo.append((sku, title, "sin cotización dólar"))
                 continue
 
+            markup = local_store.get_markup(sku) or GANANCIA_HERMANO_MULT
             costo_unit = (
-                fob * mult * NACIONALIZACION_MULT * cot * GANANCIA_HERMANO_MULT
+                fob * mult * NACIONALIZACION_MULT * cot * markup
             )
             costo += costo_unit * quantity
             neto_calc += neto_manual
@@ -2443,6 +3160,8 @@ class VentasApp:
 
         save_btn.configure(command=do_save)
         entry.bind("<Return>", lambda e: do_save())
+        win.bind("<Return>", lambda e: do_save())
+        win.bind("<KP_Enter>", lambda e: do_save())
         win.bind("<Escape>", lambda e: win.destroy())
 
         # Centrar sobre la ventana principal.
