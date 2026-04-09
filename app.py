@@ -124,6 +124,12 @@ def _normalize(text: str) -> str:
 NACIONALIZACION_MULT = 1.9
 GANANCIA_HERMANO_MULT = 1.30
 
+# Pago promedio a Héctor por entregar un envío Flex (self_service).
+# Es un costo externo a ML/MP que no aparece en ningún endpoint del API,
+# por eso lo modelamos acá como constante. Aproximación inicial; cuando
+# Pablo me pase el número exacto (o la regla por zona/peso) se actualiza.
+PAGO_HECTOR_FLEX = 6500.0
+
 
 class VentasApp:
     def __init__(self, root: tk.Tk):
@@ -597,6 +603,12 @@ class VentasApp:
             rows.append(("Envío", "cargando…", "#888"))
         elif info.get("shipping_cost"):
             rows.append(("Envío", -(info.get("shipping_cost") or 0), "#c0392b"))
+        # Pago a Héctor (solo en Flex). Es un costo externo que no viene del
+        # API; lo aplica _on_shipping_cost_loaded como constante.
+        if info.get("pago_hector"):
+            rows.append(
+                ("Pago Héctor (Flex)", -(info.get("pago_hector") or 0), "#c0392b")
+            )
         if info.get("taxes_amount"):
             rows.append(("Impuestos", -(info.get("taxes_amount") or 0), "#c0392b"))
         rows.append(("Neto", info.get("neto") or 0, "#1e7a1e"))
@@ -647,33 +659,53 @@ class VentasApp:
             font=("TkDefaultFont", 9),
         ).pack(anchor="w")
 
-        # Chip "⚡ Flex con bonificación": cuando el shipment es self_service
-        # (Flex) y el cost al seller es 0, MP suele sumarle al seller una
-        # bonificación que el API público no expone. Avisamos al usuario que
-        # la "Ganancia Mercado Pago" calculada está SUBESTIMADA en este caso.
-        # Ver investigación en CLAUDE.md / sesión "discrepancia con MP".
-        if (
-            info.get("shipping_loaded")
-            and info.get("logistic_type") == "self_service"
-            and float(info.get("shipping_cost") or 0) == 0
-        ):
-            ttk.Label(
-                self.detail_payment_frame,
-                text="⚡ Flex con bonificación de envío",
-                foreground="#d35400",
-                font=("TkDefaultFont", 10, "bold"),
-            ).pack(anchor="w", pady=(8, 0))
-            ttk.Label(
-                self.detail_payment_frame,
-                text=(
-                    "MP te suma un crédito por hacer el envío que el API\n"
-                    "no expone. El total real va a ser MAYOR que la\n"
-                    "Ganancia mostrada arriba."
-                ),
-                foreground="#888",
-                font=("TkDefaultFont", 9, "italic"),
-                justify="left",
-            ).pack(anchor="w")
+        # Chips de tipo de envío para que sea claro qué cubre el cálculo:
+        # - Flex (self_service + cost 0): el seller hace el delivery, lo
+        #   paga afuera (a Héctor en el caso de Pablo), y MP le suma una
+        #   bonificación que el API público no expone. Por eso ese caso es
+        #   el más "ciego" del cálculo.
+        # - Mercado Envíos: ML maneja la logística y el cost al seller
+        #   ya está reflejado en la línea "Envío" arriba (viene de
+        #   /shipments/{id}/costs → senders[0].cost). Cálculo confiable.
+        if info.get("shipping_loaded"):
+            is_flex = (
+                info.get("logistic_type") == "self_service"
+                and float(info.get("shipping_cost") or 0) == 0
+            )
+            if is_flex:
+                tk.Label(
+                    self.detail_payment_frame,
+                    text="  ⚡ Flex (Héctor descontado)  ",
+                    foreground="white",
+                    background="#d35400",
+                    font=("TkDefaultFont", 9, "bold"),
+                ).pack(anchor="w", pady=(8, 0))
+                ttk.Label(
+                    self.detail_payment_frame,
+                    text=(
+                        f"Se descontó el pago promedio a Héctor "
+                        f"({format_price(PAGO_HECTOR_FLEX)}).\n"
+                        "MP te suma una bonificación por el envío que el\n"
+                        "API no expone — el real puede ser un poco mayor."
+                    ),
+                    foreground="#888",
+                    font=("TkDefaultFont", 9, "italic"),
+                    justify="left",
+                ).pack(anchor="w")
+            else:
+                tk.Label(
+                    self.detail_payment_frame,
+                    text="  📦 Mercado Envíos  ",
+                    foreground="white",
+                    background="#1f4e9d",
+                    font=("TkDefaultFont", 9, "bold"),
+                ).pack(anchor="w", pady=(8, 0))
+                ttk.Label(
+                    self.detail_payment_frame,
+                    text="El costo del envío ya está descontado arriba.",
+                    foreground="#888",
+                    font=("TkDefaultFont", 9, "italic"),
+                ).pack(anchor="w")
 
     def _render_ganancia(self, info: dict | None):
         frame = self.detail_ganancia_frame
@@ -732,6 +764,47 @@ class VentasApp:
             foreground="#1e7a1e",
             font=("TkDefaultFont", 12, "bold", "underline"),
         ).pack(side="right")
+
+        # Margen sobre el bruto (precio de venta listado en ML).
+        # Es la métrica estándar de "comercio": de cada peso vendido,
+        # cuántos centavos quedan como ganancia neta para Pablo.
+        # Thresholds aproximados para revendedores de importación en ML:
+        #   < 10%   → MUY BAJO  (rojo)    no rinde después del laburo
+        #   10-20%  → BAJO      (naranja) rentable pero ajustado
+        #   20-30%  → BUENO     (verde)   margen sano de importador
+        #   > 30%   → EXCELENTE (violeta) producto ganador
+        total_amount = float((info or {}).get("total_amount") or 0)
+        if total_amount > 0:
+            margen_pct = (ganancia / total_amount) * 100
+            if margen_pct < 10:
+                chip_text, chip_bg = "MUY BAJO", "#c0392b"
+            elif margen_pct < 20:
+                chip_text, chip_bg = "BAJO", "#d35400"
+            elif margen_pct < 30:
+                chip_text, chip_bg = "BUENO", "#1e7a1e"
+            else:
+                chip_text, chip_bg = "EXCELENTE", "#7d3c98"
+
+            margen_row = ttk.Frame(frame)
+            margen_row.pack(fill="x", anchor="w", pady=(8, 0))
+            ttk.Label(
+                margen_row,
+                text="Margen",
+                font=("TkDefaultFont", 11, "bold"),
+            ).pack(side="left")
+            tk.Label(
+                margen_row,
+                text=f"{margen_pct:.1f}%",
+                foreground="#1a3a5c",
+                font=("TkDefaultFont", 12, "bold"),
+            ).pack(side="left", padx=(8, 8))
+            tk.Label(
+                margen_row,
+                text=f"  {chip_text}  ",
+                foreground="white",
+                background=chip_bg,
+                font=("TkDefaultFont", 9, "bold"),
+            ).pack(side="left")
 
     def _render_costo(self, producto: dict | None, sku: str | None):
         frame = self.detail_costo_frame
@@ -1128,15 +1201,17 @@ class VentasApp:
             label_v = "venta es" if n == 1 else "ventas son"
             tk.Label(
                 outer,
-                text=f"⚡ {n} {label_v} Flex con bonificación de envío",
+                text=f"⚡ {n} {label_v} Flex (Héctor ya descontado)",
                 foreground="#d35400",
                 font=("TkDefaultFont", 10, "bold"),
             ).pack(anchor="w")
             ttk.Label(
                 outer,
                 text=(
-                    "MP suma una bonificación al seller que el API no expone.\n"
-                    "El Neto MP y la Ganancia de Pablo están SUBESTIMADOS."
+                    f"Se restó {format_price(PAGO_HECTOR_FLEX)} promedio "
+                    f"por entrega.\n"
+                    "MP suma una bonificación por el envío que el API no\n"
+                    "expone — el real puede ser un poco mayor."
                 ),
                 foreground="#888",
                 font=("TkDefaultFont", 9, "italic"),
@@ -2955,18 +3030,28 @@ class VentasApp:
     def _on_shipping_cost_loaded(self, leaf_id: str, cost: float, logistic_type):
         """Callback main-thread: aplica el shipping cost + logistic_type a
         una venta y recalcula el neto. Refresca panel de detalle si la fila
-        está seleccionada y actualiza el mini totalizador."""
+        está seleccionada y actualiza el mini totalizador.
+
+        Para envíos Flex (self_service con shipping_cost == 0) además resta
+        PAGO_HECTOR_FLEX, que es lo que Pablo le paga afuera al delivery
+        para hacer la entrega — un costo real que ML/MP no expone en ningún
+        endpoint y que la app modela como constante.
+        """
         info = self.leaf_to_item.get(leaf_id)
         if info is None:
             return
         info["shipping_cost"] = cost
         info["shipping_loaded"] = True
         info["logistic_type"] = logistic_type
+        is_flex = logistic_type == "self_service" and cost == 0
+        pago_hector = PAGO_HECTOR_FLEX if is_flex else 0.0
+        info["pago_hector"] = pago_hector
         info["neto"] = (
             float(info.get("total_amount") or 0)
             - float(info.get("sale_fee") or 0)
             - cost
             - float(info.get("taxes_amount") or 0)
+            - pago_hector
         )
         # Si la fila afectada es la seleccionada, redibujamos el panel.
         sel = self.tree.selection()
