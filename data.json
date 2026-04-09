@@ -1,6 +1,11 @@
 {
-  "checks": [],
-  "notas": {},
+  "checks": [
+    "2000015907553300",
+    "2000015908762376"
+  ],
+  "notas": {
+    "2000015908762376": "a cuanto deberia ponerlo"
+  },
   "fob": {
     "PERCHA-MAGICA-3": {
       "precio": 0.15,
@@ -9,6 +14,14 @@
     "GP-6BRUTZO8": {
       "precio": 0.35,
       "mult": 5
+    },
+    "GP-EI8ZZIMK": {
+      "precio": 2.5,
+      "mult": 1
+    },
+    "GP-YKAGK1AS": {
+      "precio": 0.93,
+      "mult": 6
     }
   },
   "etiquetas_catalogo": [
@@ -19,7 +32,9 @@
     "Pack 10",
     "Gris",
     "Pack 5",
-    "Blanco"
+    "Blanco",
+    "Una Unidad",
+    "Acrílico Común"
   ],
   "etiquetas_por_sku": {
     "PERCHA-MAGICA-3": [
@@ -43,13 +58,21 @@
       "Pack 5",
       "Remera Rígida",
       "Blanco"
+    ],
+    "GP-EI8ZZIMK": [
+      "Una Unidad",
+      "Acrílico Común",
+      "Blanco"
     ]
   },
   "neto_manual": {
     "2000015906400856": 18813.56,
-    "2000015906070442": 27882.65
+    "2000015906070442": 27882.65,
+    "2000015907553300": 26770.5,
+    "2000015908762376": 77753.18
   },
   "shipping_manual": {
-    "2000015906400856": 6500.0
+    "2000015906400856": 6500.0,
+    "2000015907553300": 6500.0
   }
 }
