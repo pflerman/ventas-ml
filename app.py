@@ -349,6 +349,11 @@ class VentasApp:
         self.root.bind("<KeyRelease-Alt_L>", lambda e: self._modifier_released("alt"))
         self.root.bind("<KeyRelease-Alt_R>", lambda e: self._modifier_released("alt"))
 
+        # F1 sobre la fila seleccionada → editor de la publicación en ML.
+        # ML redirige /publicaciones/{item_id}/modificar a la URL larga con
+        # el token de sesión, así que usamos la forma corta y estable.
+        self.root.bind("<F1>", self._on_f1_edit_publicacion)
+
         self.context_menu = tk.Menu(self.tree, tearoff=0)
         self.context_menu.add_command(
             label="Copiar SKU", command=self._copy_clicked_sku
@@ -772,9 +777,10 @@ class VentasApp:
             font=("TkDefaultFont", 10, "bold"),
         ).pack(side="right")
 
-        # Neto MP: cargado a mano por el usuario.
+        # Neto MP + envío manual (ambos cargados a mano).
         order_id = self._current_order_id_for_info(info)
         neto = local_store.get_neto_manual(order_id) if order_id else None
+        shipping = local_store.get_shipping_manual(order_id) if order_id else None
 
         ttk.Separator(
             self.detail_payment_frame, orient="horizontal"
@@ -794,26 +800,70 @@ class VentasApp:
                 font=("TkDefaultFont", 9, "italic"),
             ).pack(anchor="w", pady=(0, 4))
         else:
+            # Línea Neto MP (lo que MP te depositó).
             net_row = ttk.Frame(self.detail_payment_frame)
             net_row.pack(fill="x", anchor="w", pady=(0, 2))
-            tk.Label(
+            ttk.Label(
                 net_row,
-                text="Neto MP →",
-                foreground="#1f4e9d",
-                font=("TkDefaultFont", 12, "bold"),
+                text="Neto MP",
+                font=("TkDefaultFont", 10),
             ).pack(side="left")
             tk.Label(
                 net_row,
                 text=format_price(neto),
                 foreground="#1f4e9d",
+                font=("TkDefaultFont", 10, "bold"),
+            ).pack(side="right")
+
+            # Si hay shipping manual cargado, mostrarlo restando.
+            if shipping:
+                ship_row = ttk.Frame(self.detail_payment_frame)
+                ship_row.pack(fill="x", anchor="w", pady=1)
+                ttk.Label(
+                    ship_row,
+                    text="Envío (Flex)",
+                    font=("TkDefaultFont", 10),
+                ).pack(side="left")
+                tk.Label(
+                    ship_row,
+                    text=f"- {format_price(shipping)}",
+                    foreground="#c0392b",
+                    font=("TkDefaultFont", 10, "bold"),
+                ).pack(side="right")
+
+            # Total efectivo: si hay envío cargado, neto - envío. Si no, igual al neto.
+            ttk.Separator(
+                self.detail_payment_frame, orient="horizontal"
+            ).pack(fill="x", pady=(4, 2))
+            efectivo = neto - (shipping or 0)
+            efectivo_row = ttk.Frame(self.detail_payment_frame)
+            efectivo_row.pack(fill="x", anchor="w", pady=(0, 2))
+            tk.Label(
+                efectivo_row,
+                text="Neto efectivo →",
+                foreground="#1f4e9d",
+                font=("TkDefaultFont", 12, "bold"),
+            ).pack(side="left")
+            tk.Label(
+                efectivo_row,
+                text=format_price(efectivo),
+                foreground="#1f4e9d",
                 font=("TkDefaultFont", 12, "bold", "underline"),
             ).pack(side="right")
 
+        # Botones para cargar/editar ambos valores.
+        btns_pago = ttk.Frame(self.detail_payment_frame)
+        btns_pago.pack(fill="x", anchor="w", pady=(6, 0))
         ttk.Button(
-            self.detail_payment_frame,
-            text="✏️ Cargar / editar neto MP",
+            btns_pago,
+            text="✏️ Neto MP",
             command=lambda oid=order_id: self._open_neto_modal(oid),
-        ).pack(anchor="w", pady=(4, 0))
+        ).pack(side="left")
+        ttk.Button(
+            btns_pago,
+            text="🚚 Envío",
+            command=lambda oid=order_id: self._open_envio_modal(oid),
+        ).pack(side="left", padx=(6, 0))
 
         method = info.get("payment_method") or ""
         if method:
@@ -884,8 +934,9 @@ class VentasApp:
         btns.pack(fill="x")
 
         def do_save():
-            raw = neto_var.get().strip().replace(".", "").replace(",", ".")
-            # ↑ tolerante con formato AR ("18.000,50") y formato simple ("18000.50")
+            # Punto como separador decimal. Acepta también coma por las dudas
+            # (la convertimos a punto). NO interpretamos punto como miles.
+            raw = neto_var.get().strip().replace(",", ".")
             if raw == "":
                 new_neto = None
             else:
@@ -922,11 +973,94 @@ class VentasApp:
         win.geometry(f"+{x}+{y}")
         win.grab_set()
 
+    def _open_envio_modal(self, order_id: str | None):
+        """Modal para cargar/editar el costo de envío (Flex) de una venta.
+        Si está cargado, se resta del neto MP en todos los cálculos."""
+        if not order_id:
+            self._flash_status("Seleccioná una venta antes de cargar el envío")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Costo de envío")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        frame = ttk.Frame(win, padding=15)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text=f"Venta #{order_id}",
+            font=("TkDefaultFont", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+        ttk.Label(
+            frame,
+            text="Lo que vas a pagar afuera por la entrega (Flex/Héctor).",
+            foreground="#666",
+        ).pack(anchor="w", pady=(0, 12))
+
+        ttk.Label(frame, text="Costo envío (ARS):").pack(anchor="w")
+        actual = local_store.get_shipping_manual(order_id)
+        env_var = tk.StringVar(value=f"{actual:.2f}" if actual else "")
+        entry = ttk.Entry(frame, textvariable=env_var, width=20)
+        entry.pack(anchor="w", pady=(2, 12))
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        ttk.Label(
+            frame,
+            text="Dejar vacío o 0 para borrar el envío cargado.",
+            foreground="#888",
+            font=("TkDefaultFont", 9, "italic"),
+        ).pack(anchor="w", pady=(0, 8))
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+
+        def do_save():
+            # Punto como separador decimal. Acepta también coma por las dudas.
+            raw = env_var.get().strip().replace(",", ".")
+            if raw == "":
+                new_env = None
+            else:
+                try:
+                    new_env = float(raw)
+                except ValueError:
+                    self._flash_status("Valor inválido — debe ser un número")
+                    return
+                if new_env < 0:
+                    self._flash_status("El envío no puede ser negativo")
+                    return
+            try:
+                local_store.set_shipping_manual(order_id, new_env)
+            except Exception as e:
+                messagebox.showerror(
+                    "Error", f"No se pudo guardar el envío:\n{e}", parent=win
+                )
+                return
+            win.destroy()
+            self._flash_status(f"Envío guardado para venta {order_id} ✓")
+            self._on_select()
+            self._update_totales_inline()
+
+        ttk.Button(btns, text="Guardar", command=do_save).pack(side="right")
+        ttk.Button(btns, text="Cancelar", command=win.destroy).pack(
+            side="right", padx=(0, 6)
+        )
+        entry.bind("<Return>", lambda _e: do_save())
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+
     def _render_ganancia(self, info: dict | None):
         frame = self.detail_ganancia_frame
         costo_unitario = self._last_costo_unitario
         order_id = self._current_order_id_for_info(info) if info else None
-        neto = local_store.get_neto_manual(order_id) if order_id else None
+        # neto efectivo = neto MP - envío manual (si está cargado).
+        neto = local_store.get_neto_efectivo(order_id) if order_id else None
 
         if costo_unitario is None or neto is None:
             faltan = []
@@ -1190,7 +1324,7 @@ class VentasApp:
         row_ind.pack(fill="x", anchor="w", pady=(4, 1))
         tk.Label(
             row_ind,
-            text="Pagar a Andrés individual:",
+            text=f"Pagar a Andrés individual (×{GANANCIA_HERMANO_MULT}):",
             foreground="#7d3c98",
             font=("TkDefaultFont", 12, "bold"),
         ).pack(side="left")
@@ -1215,6 +1349,25 @@ class VentasApp:
             foreground="#c0392b",
             font=("TkDefaultFont", 12, "bold", "underline"),
         ).pack(side="right")
+
+    def _on_f1_edit_publicacion(self, _event=None):
+        """F1 → abre el editor de la publicación en el browser para la
+        venta seleccionada. Usa la forma corta /publicaciones/{id}/modificar
+        que ML redirige a la URL larga con el token de sesión."""
+        sel = self.tree.selection()
+        if not sel:
+            self._flash_status("Seleccioná una venta primero")
+            return "break"
+        leaf_id = sel[0]
+        info = self.leaf_to_item.get(leaf_id) or {}
+        item_id = info.get("item_id") or ""
+        if not item_id:
+            self._flash_status("Esta fila no tiene ID de publicación")
+            return "break"
+        url = f"https://www.mercadolibre.com.ar/publicaciones/{item_id}/modificar"
+        self._open_url(url)
+        self._flash_status(f"Abriendo editor de {item_id}")
+        return "break"
 
     def _on_alt_click(self, event):
         row = self.tree.identify_row(event.y)
@@ -1942,7 +2095,8 @@ class VentasApp:
             info = self.leaf_to_item.get(leaf_id) or {}
             count_total += 1
             bruto += float(info.get("total_amount") or 0)
-            neto_manual = local_store.get_neto_manual(order_id)
+            # Neto efectivo: lo que queda después de restar Flex (si aplica).
+            neto_manual = local_store.get_neto_efectivo(order_id)
             if neto_manual is not None:
                 neto_all += neto_manual
 

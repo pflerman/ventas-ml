@@ -7,6 +7,10 @@
     "PERCHA-MAGICA-3": {
       "precio": 0.15,
       "mult": 1
+    },
+    "GP-6BRUTZO8": {
+      "precio": 0.35,
+      "mult": 5
     }
   },
   "etiquetas_catalogo": [
@@ -15,7 +19,9 @@
     "Acrílico Con Imanes",
     "Remera Rígida",
     "Pack 10",
-    "Gris"
+    "Gris",
+    "Pack 5",
+    "Blanco"
   ],
   "etiquetas_por_sku": {
     "PERCHA-MAGICA-3": [
@@ -34,6 +40,18 @@
       "Remera Rígida",
       "Pack 10",
       "Gris"
+    ],
+    "GP-6BRUTZO8": [
+      "Pack 5",
+      "Remera Rígida",
+      "Blanco"
     ]
+  },
+  "neto_manual": {
+    "2000015906400856": 18813.56,
+    "2000015906070442": 27882.65
+  },
+  "shipping_manual": {
+    "2000015906400856": 6500.0
   }
 }

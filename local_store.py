@@ -11,7 +11,8 @@ Estructura del JSON:
     "fob":                {"SKU": {"precio": 12.5, "mult": 1}},
     "etiquetas_catalogo": ["ordenador", "blanco", ...],  # valores permitidos
     "etiquetas_por_sku":  {"SKU": ["ordenador", ...]},   # asignaciones
-    "neto_manual":        {"order_id": 12345.67}         # neto MP cargado a mano
+    "neto_manual":        {"order_id": 12345.67},        # neto MP cargado a mano
+    "shipping_manual":    {"order_id": 6500.00}          # costo Flex que paga el seller
 }
 
 Patrón de uso:
@@ -33,6 +34,7 @@ _data: dict = {
     "etiquetas_catalogo": [],
     "etiquetas_por_sku": {},
     "neto_manual": {},
+    "shipping_manual": {},
 }
 _checks_set: set[str] = set()
 _loaded = False
@@ -294,3 +296,47 @@ def set_neto_manual(order_id: str, neto: float | None) -> None:
 
 def count_neto_manual() -> int:
     return len(_data["neto_manual"])
+
+
+# ────────────────────── Costo de envío manual (Flex) ──────────────────────
+# Costo del envío que el seller paga afuera (típicamente Flex con Héctor).
+# Si está cargado, se RESTA del neto MP para obtener el "neto efectivo" —
+# es plata que ya salió del bolsillo del seller después de cobrar a MP.
+
+def get_shipping_manual(order_id: str) -> float | None:
+    if not order_id:
+        return None
+    val = _data["shipping_manual"].get(order_id)
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def set_shipping_manual(order_id: str, costo: float | None) -> None:
+    """Persiste el costo. Si es None o 0, borra la entrada."""
+    if not order_id:
+        return
+    if costo is None or costo == 0:
+        if order_id not in _data["shipping_manual"]:
+            return
+        _data["shipping_manual"].pop(order_id, None)
+    else:
+        _data["shipping_manual"][order_id] = float(costo)
+    _save()
+
+
+def count_shipping_manual() -> int:
+    return len(_data["shipping_manual"])
+
+
+def get_neto_efectivo(order_id: str) -> float | None:
+    """Neto MP menos costo de envío manual. Devuelve None si falta el neto.
+    Si no hay shipping cargado, devuelve el neto tal cual."""
+    neto = get_neto_manual(order_id)
+    if neto is None:
+        return None
+    shipping = get_shipping_manual(order_id) or 0.0
+    return neto - shipping
