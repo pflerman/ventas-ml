@@ -1119,6 +1119,30 @@ class VentasApp:
             outer, text=header_text, font=("TkDefaultFont", 11, "bold")
         ).pack(anchor="w", pady=(0, 10))
 
+        # Warning de Flex con bonificación: si alguna(s) seleccionada(s) son
+        # Flex con shipping cost 0, MP les suma una bonificación que el API
+        # no expone, así que el "Neto MP" / "Ganancia de Pablo total" están
+        # subestimados para esas ventas.
+        if totales.get("count_flex_bonif", 0) > 0:
+            n = totales["count_flex_bonif"]
+            label_v = "venta es" if n == 1 else "ventas son"
+            tk.Label(
+                outer,
+                text=f"⚡ {n} {label_v} Flex con bonificación de envío",
+                foreground="#d35400",
+                font=("TkDefaultFont", 10, "bold"),
+            ).pack(anchor="w")
+            ttk.Label(
+                outer,
+                text=(
+                    "MP suma una bonificación al seller que el API no expone.\n"
+                    "El Neto MP y la Ganancia de Pablo están SUBESTIMADOS."
+                ),
+                foreground="#888",
+                font=("TkDefaultFont", 9, "italic"),
+                justify="left",
+            ).pack(anchor="w", pady=(0, 8))
+
         if totales["count_total"] == 0:
             ttk.Label(
                 outer,
@@ -1641,6 +1665,11 @@ class VentasApp:
         sin_costo: list[tuple[str, str, str]] = []
         count_total = 0
         count_calc = 0
+        # Conteo de ventas Flex con bonificación de envío (logistic_type
+        # self_service + shipping_cost 0). En esos casos MP suma una
+        # bonificación al seller que el API público no expone, así que el
+        # neto está SUBESTIMADO. Lo mostramos como warning en el modal.
+        count_flex_bonif = 0
         cot = dolar.get()
 
         # Iterar TODAS las leaves cargadas (incluso ocultas por el filtro),
@@ -1652,6 +1681,12 @@ class VentasApp:
             count_total += 1
             bruto += float(info.get("total_amount") or 0)
             neto_all += float(info.get("neto") or 0)
+            if (
+                info.get("shipping_loaded")
+                and info.get("logistic_type") == "self_service"
+                and float(info.get("shipping_cost") or 0) == 0
+            ):
+                count_flex_bonif += 1
 
             sku = info.get("sku") or ""
             title = info.get("title") or ""
@@ -1685,6 +1720,7 @@ class VentasApp:
         return {
             "count_total": count_total,
             "count_calc": count_calc,
+            "count_flex_bonif": count_flex_bonif,
             "bruto": bruto,
             "neto_all": neto_all,
             "neto_calc": neto_calc,
