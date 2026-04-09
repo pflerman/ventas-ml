@@ -3,3 +3,5 @@ python-dotenv
 Pillow
 openpyxl
 httpx
+anthropic
+mcp

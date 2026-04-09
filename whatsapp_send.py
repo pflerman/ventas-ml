@@ -4,11 +4,13 @@ El MCP corre como servicio systemd en http://localhost:3100/mcp (StreamableHTTP)
 Usamos el SDK oficial de MCP en Python para hacer una sesión efímera por mensaje.
 
 Es sync a propósito — quien lo llama es el que decide si lo corre en thread.
+
+Imports lazy: en WSL no está instalado el SDK `mcp` ni corre el servicio
+whatsapp-mcp, así que importar al top-level haría fallar `import whatsapp_send`
+y rompería toda la app. Importamos adentro de `enviar()` y devolvemos
+`(False, ...)` si el módulo no está.
 """
 import asyncio
-
-from mcp import ClientSession
-from mcp.client.streamable_http import streamablehttp_client
 
 _MCP_URL = "http://localhost:3100/mcp"
 # Tu número personal — el WHATSAPP_PHONE del unit file de whatsapp-mcp.
@@ -16,6 +18,9 @@ PABLO_JID = "5491140461603@s.whatsapp.net"
 
 
 async def _enviar_async(contacto: str, mensaje: str) -> tuple[bool, str]:
+    from mcp import ClientSession
+    from mcp.client.streamable_http import streamablehttp_client
+
     async with streamablehttp_client(_MCP_URL) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
@@ -36,5 +41,7 @@ def enviar(mensaje: str, contacto: str = PABLO_JID) -> tuple[bool, str]:
     """Manda un mensaje. Retorna (ok, detalle). Bloquea hasta que termine."""
     try:
         return asyncio.run(_enviar_async(contacto, mensaje))
+    except ModuleNotFoundError as e:
+        return False, f"falta SDK mcp: {e.name}"
     except Exception as e:
         return False, f"{type(e).__name__}: {e}"
