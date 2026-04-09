@@ -1,6 +1,6 @@
 # ventas-ml — contexto para Claude
 
-App Tkinter en Python que lista las ventas de MercadoLibre (cuenta PaliShopping, USER_ID 24192412) en vivo, agrupadas por día. Panel lateral con detalle del producto, costeo de importación FOB → precio final → ganancia neta sobre cobro de Mercado Pago, margen porcentual con chip de "BAJO/BUENO/EXCELENTE", chips diferenciando envío Flex (Héctor) vs Mercado Envíos, filtro de búsqueda/exclusión sobre el listado, modal de totales seleccionados con filas clicables para copiar al portapapeles, y un modal extra de "Frase del día" que llama a la API de Anthropic on-demand y permite enviarse la frase por WhatsApp. Pensada para uso interno del vendedor.
+App Tkinter en Python que lista las ventas de MercadoLibre (cuenta PaliShopping, USER_ID 24192412) en vivo, agrupadas por día. Panel lateral con detalle del producto, costeo de importación FOB → precio final → ganancia neta sobre cobro de Mercado Pago, margen porcentual con chip de "BAJO/BUENO/EXCELENTE", chips diferenciando envío Flex (Héctor) vs Mercado Envíos, **notas libres por venta para marcar casos sospechosos**, filtro de búsqueda/exclusión + filtro "solo con nota" sobre el listado, modal de totales seleccionados con filas clicables para copiar al portapapeles, y un modal extra de "Frase del día" que llama a la API de Anthropic on-demand y permite enviarse la frase por WhatsApp. Pensada para uso interno del vendedor.
 
 ## Dependencias externas (críticas)
 
@@ -27,7 +27,7 @@ Si las paths no existen, el render PIL tira excepción y el modal muestra el err
 
 - **`app.py`** — monolito con la clase `VentasApp`. UI = barra de filtro arriba del tree, `PanedWindow` horizontal (Treeview izq, panel scrollable der), bottom bar con status + cotización + mini totalizador + botones.
 - **`productos_lookup.py`** — cache `{sku → dict}` en memoria, lectura única al arrancar (~100 productos). Provee título y etiquetas.
-- **`ventas_db.py`** — cache en memoria + write-through asíncrono para checks y FOBs. Mismo patrón que `gestor-productos/app/db.py`. Tablas `ventas_checks` y `ventas_fob` (con columna `multiplicador` nullable).
+- **`ventas_db.py`** — cache en memoria + write-through asíncrono para checks, FOBs y notas. Mismo patrón que `gestor-productos/app/db.py`. Tablas `ventas_checks`, `ventas_fob` (con columna `multiplicador` nullable) y `ventas_notas` (order_id → texto libre + updated_at).
 - **`dolar.py`** — fetch único de la cotización al arrancar, queda en memoria hasta cerrar la app.
 - **`frase.py`** — gemelo a `dolar.py` (mismo patrón `cargar()` / `get()` / `loaded()`), pero **no se llama al arrancar**. Solo cuando el usuario abre el modal de "Frase del día". Cada apertura del modal llama a `cargar()` de nuevo, así que cada vez es una frase fresca.
 - **`whatsapp_send.py`** — cliente mínimo del MCP de whatsapp-mcp. Función sync `enviar(mensaje, contacto)` que abre una sesión MCP efímera, llama al tool `enviar_mensaje` y cierra. Devuelve `(ok, detalle)`. Quien lo llama es el que decide si lo corre en thread (la UI sí lo hace).
@@ -196,6 +196,25 @@ Implicancias:
 **Los umbrales son aproximados para revendedores de importación en ML Argentina**, no son universales. Si Pablo cambia de rubro o estrategia, son los primeros números a revisar.
 
 **Importante: NO simplificar a un solo chip "tipo envío"** — la diferencia entre "cálculo confiable (Mercado Envíos)" y "cálculo con dos componentes ciegos (Flex)" es justo la información valiosa. Tampoco renombrar los chips con nombres genéricos: el texto "Héctor descontado" / "Mercado Envíos" es lo que comunica al usuario qué confianza tener en el número.
+
+### Notas libres por venta + filtro "solo con nota"
+
+Tabla `ventas_notas (order_id PK, nota TEXT, updated_at INTEGER)` en Turso. Cache en memoria + write-through async, mismo patrón que `ventas_checks` y `ventas_fob`. La API expone `get_nota`, `has_nota`, `count_with_nota`, `set_nota_local` (sync, cache), `persist_nota` (sync HTTP, llamar desde thread).
+
+**Convención de "borrar nota"**: nota vacía (`""` o solo whitespace) **no se persiste** — `persist_nota` con string vacío hace `DELETE`, y `set_nota_local` con vacío saca de la cache. La presencia en `_notas` es la fuente de verdad para `has_nota`.
+
+**Widget UI**: `tk.Text` de 4 líneas en el panel de detalle, debajo de "Ganancia total" y antes del separador de "Frase del día". Tres handlers que coordinan el ciclo de vida:
+- `_load_nota_into_widget(order_id)` se llama desde `_on_select`. Setea el flag `_nota_loading=True` mientras escribe en el widget para que el siguiente FocusOut no interprete eso como input del usuario.
+- `_on_nota_focus_out` persiste si cambió, actualiza el tag visual del row, refresca el filtro si está activo.
+- `_flush_nota_pendiente` se llama también desde `_on_select` ANTES de cargar la venta nueva, para no perder la nota si el usuario cambió de fila sin pasar por FocusOut.
+
+**No quitar el `_nota_loading` flag** — sin él, `_load_nota_into_widget` dispara FocusOut de forma indirecta y la nota recién cargada se "guarda" como si fuera input nuevo, pisando notas reales con strings idénticos (parece inocuo pero genera writes inútiles a Turso).
+
+**Indicador visual**: tag `with_note` en el Treeview con `foreground="#7d3c98"` (violeta). **No usa background a propósito** — para no chocar con el tag `selected` que pinta el background verde cuando hay check. Una fila puede tener varios tags simultáneos: `("selected", "with_note")` se ve verde con texto violeta. El método `_row_tags(row_id, order_id)` arma la tupla mirando los dos estados (check + nota).
+
+**Filtro "solo con nota"**: `BooleanVar` `_solo_con_nota_var` con un `ttk.Checkbutton` al lado del botón "Limpiar". `_refresh_tree_filter` lo combina con buscar/excluir por intersección. **El botón "Limpiar" también lo apaga** (junto con limpiar los textos de buscar/excluir), porque "limpiar filtros" debe dejar la vista neutral. Si lo "limpiás" sin apagar el toggle se vuelve confuso.
+
+**Por qué no usar emoji 📝 como prefijo de columna en lugar del tag**: porque los emojis no rendean en Tk-Linux con la fuente default (ver trampa "Emojis no se rinden en Tk-Linux"). El tag de foreground es la única forma confiable de marcar un row.
 
 ### Emojis no se rinden en Tk-Linux — la frase usa PIL
 
