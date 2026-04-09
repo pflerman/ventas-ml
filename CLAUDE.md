@@ -15,7 +15,7 @@ App Tkinter que lista las ventas de MercadoLibre (PaliShopping, USER_ID 24192412
 
 ## Persistencia: `local_store.py` + `data.json`
 
-Toda la persistencia está en un único JSON al lado del proyecto. No hay Turso, no hay base remota, no hay write-through async — escribir el JSON entero es instantáneo a esta escala. `local_store` expone API sync para checks, FOBs, multiplicadores, notas y etiquetas. Cada `set_*` reescribe el archivo de forma atómica (tmp + rename).
+Toda la persistencia está en un único JSON al lado del proyecto. No hay Turso, no hay base remota, no hay write-through async — escribir el JSON entero es instantáneo a esta escala. `local_store` expone API sync para checks, FOBs, multiplicadores, notas, etiquetas y neto manual. Cada `set_*` reescribe el archivo de forma atómica (tmp + rename).
 
 Estructura del JSON:
 ```json
@@ -24,11 +24,12 @@ Estructura del JSON:
   "notas":              {"order_id": "texto"},
   "fob":                {"SKU": {"precio": 12.5, "mult": 1}},
   "etiquetas_catalogo": ["ordenador", "blanco", ...],
-  "etiquetas_por_sku":  {"SKU": ["ordenador", ...]}
+  "etiquetas_por_sku":  {"SKU": ["ordenador", ...]},
+  "neto_manual":        {"order_id": 12345.67}
 }
 ```
 
-`data.json` está en `.gitignore`.
+**`data.json` SÍ va al repo** — Pablo carga FOBs, multiplicadores, etiquetas y netos a mano y los necesita en cualquier máquina donde corra la app. Que los checks y notas vivan ahí también es un efecto colateral asumido (mismo archivo).
 
 ## Trampas
 
@@ -44,20 +45,13 @@ Estructura del JSON:
 
 El mini totalizador y `_calcular_totales_seleccionados` iteran `row_to_order` a propósito. Si los pasás a `_all_leaves()`, los totales se rompen al filtrar.
 
-### Cálculo del neto MP — heurístico
+### Neto MP — manual por venta
 
-```python
-neto = total_amount - sale_fee - shipping_cost - taxes_amount
-```
+**El neto NO se calcula desde la API.** Antes había heurísticos (sale_fee, taxes, shipping, etc.) que se restaban del total y daban un neto aproximado. Eso se eliminó completamente. Ahora Pablo va al detalle de la venta en Mercado Pago, copia el neto real, y lo pega en el modal "✏️ Cargar / editar neto MP" del panel de detalle. Se persiste por `order_id` en `local_store.neto_manual`.
 
-Donde `shipping_cost` es **un heurístico inline** calculado al cargar la orden, sin llamadas extra a `/shipments/{id}/costs`. Reglas:
+Cualquier cálculo que dependa del neto (`_render_ganancia`, `_render_payment`, `_calcular_totales_seleccionados`) lee de `local_store.get_neto_manual(order_id)`. Si no está cargado, la UI muestra "⚠️ Falta neto MP" y la venta no entra en el cómputo de ganancia/totales.
 
-- Si la orden tiene shipment Y `total_amount >= SHIPPING_FREE_THRESHOLD` → `shipping_cost = total_amount * SHIPPING_FREE_RATE`
-- Si no → `shipping_cost = 0`
-
-Las dos constantes están al tope de `app.py` (`SHIPPING_FREE_THRESHOLD = 30000`, `SHIPPING_FREE_RATE = 0.07`). Son ajustables a ojo. **No buscar precisión** — el objetivo era sacar todas las llamadas por shipment porque metían cientos de requests por carga y la app se sentía lenta.
-
-**No restar `coupon_amount`** — bug histórico, `total_amount` ya incluye el listado completo, el cupón es un crédito al seller.
+Bruto sí se sigue mostrando porque viene gratis del listado de orders (`order.total_amount`) y no es un cálculo.
 
 ### SKU viene tal cual de la API
 
@@ -78,10 +72,8 @@ Las etiquetas se asignan a SKUs desde un combobox alimentado por un catálogo. E
 ### Constantes comerciales hardcodeadas
 
 ```python
-NACIONALIZACION_MULT = 1.9          # impuestos importación China
-GANANCIA_HERMANO_MULT = 1.30        # markup de Andrés
-SHIPPING_FREE_THRESHOLD = 30000.0   # umbral para asumir envío gratis ML
-SHIPPING_FREE_RATE = 0.07           # % del total que paga el seller cuando aplica
+NACIONALIZACION_MULT = 1.9     # impuestos importación China
+GANANCIA_HERMANO_MULT = 1.30   # markup de Andrés
 ```
 
 Al tope de `app.py`. Son políticas del usuario, no del catálogo.

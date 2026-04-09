@@ -1,0 +1,39 @@
+{
+  "checks": [
+    "2000015906400856"
+  ],
+  "notas": {},
+  "fob": {
+    "PERCHA-MAGICA-3": {
+      "precio": 0.15,
+      "mult": 1
+    }
+  },
+  "etiquetas_catalogo": [
+    "Percha Mágica",
+    "Armario Modular",
+    "Acrílico Con Imanes",
+    "Remera Rígida",
+    "Pack 10",
+    "Gris"
+  ],
+  "etiquetas_por_sku": {
+    "PERCHA-MAGICA-3": [
+      "Percha Mágica"
+    ],
+    "GP-GUENA7SH": [
+      "Armario Modular"
+    ],
+    "GP-U72NUNN0": [
+      "Armario Modular"
+    ],
+    "GP-9DSJ11BH": [
+      "Acrílico Con Imanes"
+    ],
+    "ORGANIZADOR-REMERA-RIGIDO-GRIS": [
+      "Remera Rígida",
+      "Pack 10",
+      "Gris"
+    ]
+  }
+}

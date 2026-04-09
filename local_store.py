@@ -10,7 +10,8 @@ Estructura del JSON:
     "notas":              {"order_id": "texto"},         # nota libre por venta
     "fob":                {"SKU": {"precio": 12.5, "mult": 1}},
     "etiquetas_catalogo": ["ordenador", "blanco", ...],  # valores permitidos
-    "etiquetas_por_sku":  {"SKU": ["ordenador", ...]}    # asignaciones
+    "etiquetas_por_sku":  {"SKU": ["ordenador", ...]},   # asignaciones
+    "neto_manual":        {"order_id": 12345.67}         # neto MP cargado a mano
 }
 
 Patrón de uso:
@@ -31,6 +32,7 @@ _data: dict = {
     "fob": {},
     "etiquetas_catalogo": [],
     "etiquetas_por_sku": {},
+    "neto_manual": {},
 }
 _checks_set: set[str] = set()
 _loaded = False
@@ -260,3 +262,35 @@ def remove_etiqueta_de_sku(sku: str, etiqueta: str) -> None:
     if not ets:
         _data["etiquetas_por_sku"].pop(sku, None)
     _save()
+
+
+# ────────────────────── Neto MP manual ──────────────────────
+
+def get_neto_manual(order_id: str) -> float | None:
+    """Devuelve el neto MP cargado a mano para una venta, o None si falta."""
+    if not order_id:
+        return None
+    val = _data["neto_manual"].get(order_id)
+    if val is None:
+        return None
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return None
+
+
+def set_neto_manual(order_id: str, neto: float | None) -> None:
+    """Persiste el neto. Si es None o 0, borra la entrada."""
+    if not order_id:
+        return
+    if neto is None or neto == 0:
+        if order_id not in _data["neto_manual"]:
+            return
+        _data["neto_manual"].pop(order_id, None)
+    else:
+        _data["neto_manual"][order_id] = float(neto)
+    _save()
+
+
+def count_neto_manual() -> int:
+    return len(_data["neto_manual"])

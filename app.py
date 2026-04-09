@@ -123,13 +123,10 @@ def _normalize(text: str) -> str:
 NACIONALIZACION_MULT = 1.9
 GANANCIA_HERMANO_MULT = 1.30
 
-# Heurístico de shipping al seller. NO hacemos llamadas a /shipments/{id}/costs
-# porque metían cientos de requests por carga. En su lugar estimamos:
-# si la order tiene shipment y total_amount supera el umbral de envío
-# gratis de ML, asumimos que el seller paga ~SHIPPING_FREE_RATE del total.
-# Es deliberadamente grosero — ajustar a ojo.
-SHIPPING_FREE_THRESHOLD = 30000.0  # ARS, umbral aproximado de "envío gratis ML"
-SHIPPING_FREE_RATE = 0.07          # 7% del total cuando el seller paga
+# El neto MP NO se calcula desde la API — se carga a mano por venta desde el
+# panel de detalle. Pablo va a Mercado Pago, copia el neto real, y lo pega en
+# el modal. Persistido en local_store.neto_manual por order_id. Cualquier
+# cálculo que dependa del neto (ganancia, margen, totales) lee de ahí.
 
 
 class VentasApp:
@@ -603,7 +600,7 @@ class VentasApp:
 
         # Reset del costo unitario calculado (lo setea _render_costo si puede).
         self._last_costo_unitario = None
-        self._render_costo(sku)
+        self._render_costo(sku, info)
         self._render_payment(info)
         self._render_ganancia(info)
 
@@ -761,47 +758,62 @@ class VentasApp:
             ).pack(anchor="w")
             return
 
-        rows = [
-            ("Bruto", info.get("total_amount") or 0, "#1a3a5c"),
-            ("Comisión ML", -(info.get("sale_fee") or 0), "#c0392b"),
-        ]
-        # El shipping cost es un heurístico calculado al cargar la order
-        # (ver _on_data). No hay llamadas extra a /shipments.
-        if info.get("shipping_cost"):
-            rows.append(("Envío (estimado)", -(info.get("shipping_cost") or 0), "#c0392b"))
-        if info.get("taxes_amount"):
-            rows.append(("Impuestos", -(info.get("taxes_amount") or 0), "#c0392b"))
-        rows.append(("Neto", info.get("neto") or 0, "#1e7a1e"))
+        # Bruto sí lo mostramos como referencia — viene gratis del listado.
+        bruto = float(info.get("total_amount") or 0)
+        bruto_row = ttk.Frame(self.detail_payment_frame)
+        bruto_row.pack(fill="x", anchor="w", pady=1)
+        ttk.Label(
+            bruto_row, text="Bruto", font=("TkDefaultFont", 10)
+        ).pack(side="left")
+        tk.Label(
+            bruto_row,
+            text=format_price(bruto),
+            foreground="#1a3a5c",
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(side="right")
 
-        for label, value, color in rows:
-            row = ttk.Frame(self.detail_payment_frame)
-            row.pack(fill="x", anchor="w", pady=1)
-            is_total = label in ("Bruto", "Neto")
-            font = ("TkDefaultFont", 10, "bold") if is_total else ("TkDefaultFont", 10)
-            if label == "Neto":
-                tk.Label(
-                    row,
-                    text="Ganancia Mercado Pago →",
-                    foreground="#1f4e9d",
-                    font=("TkDefaultFont", 12, "bold"),
-                ).pack(side="left")
-                tk.Label(
-                    row,
-                    text=format_price(value),
-                    foreground="#1f4e9d",
-                    font=("TkDefaultFont", 12, "bold", "underline"),
-                ).pack(side="right")
-            else:
-                ttk.Label(row, text=label, font=font).pack(side="left")
-                # `value` puede ser un string (placeholder "cargando…") o un
-                # número. format_price() solo aplica a los números.
-                display = value if isinstance(value, str) else format_price(value)
-                tk.Label(
-                    row,
-                    text=display,
-                    foreground=color,
-                    font=font,
-                ).pack(side="right")
+        # Neto MP: cargado a mano por el usuario.
+        order_id = self._current_order_id_for_info(info)
+        neto = local_store.get_neto_manual(order_id) if order_id else None
+
+        ttk.Separator(
+            self.detail_payment_frame, orient="horizontal"
+        ).pack(fill="x", pady=(6, 4))
+
+        if neto is None:
+            tk.Label(
+                self.detail_payment_frame,
+                text="⚠️ Falta neto MP",
+                foreground="#c0392b",
+                font=("TkDefaultFont", 11, "bold"),
+            ).pack(anchor="w")
+            ttk.Label(
+                self.detail_payment_frame,
+                text="Copialo de Mercado Pago y cargalo abajo.",
+                foreground="#888",
+                font=("TkDefaultFont", 9, "italic"),
+            ).pack(anchor="w", pady=(0, 4))
+        else:
+            net_row = ttk.Frame(self.detail_payment_frame)
+            net_row.pack(fill="x", anchor="w", pady=(0, 2))
+            tk.Label(
+                net_row,
+                text="Neto MP →",
+                foreground="#1f4e9d",
+                font=("TkDefaultFont", 12, "bold"),
+            ).pack(side="left")
+            tk.Label(
+                net_row,
+                text=format_price(neto),
+                foreground="#1f4e9d",
+                font=("TkDefaultFont", 12, "bold", "underline"),
+            ).pack(side="right")
+
+        ttk.Button(
+            self.detail_payment_frame,
+            text="✏️ Cargar / editar neto MP",
+            command=lambda oid=order_id: self._open_neto_modal(oid),
+        ).pack(anchor="w", pady=(4, 0))
 
         method = info.get("payment_method") or ""
         if method:
@@ -819,15 +831,112 @@ class VentasApp:
             font=("TkDefaultFont", 9),
         ).pack(anchor="w")
 
+    def _current_order_id_for_info(self, info: dict | None) -> str | None:
+        """Helper: dado un info dict, encontrar el order_id correspondiente
+        en row_to_order. Es la única manera porque info no guarda order_id."""
+        if not info:
+            return None
+        for leaf_id, oid in self.row_to_order.items():
+            if self.leaf_to_item.get(leaf_id) is info:
+                return oid
+        return None
+
+    def _open_neto_modal(self, order_id: str | None):
+        """Modal chico para cargar/editar el neto MP de una venta."""
+        if not order_id:
+            self._flash_status("Seleccioná una venta antes de cargar el neto")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("Neto Mercado Pago")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        frame = ttk.Frame(win, padding=15)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text=f"Venta #{order_id}",
+            font=("TkDefaultFont", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+        ttk.Label(
+            frame,
+            text="Copialo del detalle de la venta en Mercado Pago.",
+            foreground="#666",
+        ).pack(anchor="w", pady=(0, 12))
+
+        ttk.Label(frame, text="Neto MP (ARS):").pack(anchor="w")
+        actual = local_store.get_neto_manual(order_id)
+        neto_var = tk.StringVar(value=f"{actual:.2f}" if actual else "")
+        entry = ttk.Entry(frame, textvariable=neto_var, width=20)
+        entry.pack(anchor="w", pady=(2, 12))
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        ttk.Label(
+            frame,
+            text="Dejar vacío o 0 para borrar el neto cargado.",
+            foreground="#888",
+            font=("TkDefaultFont", 9, "italic"),
+        ).pack(anchor="w", pady=(0, 8))
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+
+        def do_save():
+            raw = neto_var.get().strip().replace(".", "").replace(",", ".")
+            # ↑ tolerante con formato AR ("18.000,50") y formato simple ("18000.50")
+            if raw == "":
+                new_neto = None
+            else:
+                try:
+                    new_neto = float(raw)
+                except ValueError:
+                    self._flash_status("Valor inválido — debe ser un número")
+                    return
+                if new_neto < 0:
+                    self._flash_status("El neto no puede ser negativo")
+                    return
+            try:
+                local_store.set_neto_manual(order_id, new_neto)
+            except Exception as e:
+                messagebox.showerror(
+                    "Error", f"No se pudo guardar el neto:\n{e}", parent=win
+                )
+                return
+            win.destroy()
+            self._flash_status(f"Neto MP guardado para venta {order_id} ✓")
+            self._on_select()
+            self._update_totales_inline()
+
+        ttk.Button(btns, text="Guardar", command=do_save).pack(side="right")
+        ttk.Button(btns, text="Cancelar", command=win.destroy).pack(
+            side="right", padx=(0, 6)
+        )
+        entry.bind("<Return>", lambda _e: do_save())
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+
     def _render_ganancia(self, info: dict | None):
         frame = self.detail_ganancia_frame
         costo_unitario = self._last_costo_unitario
-        neto = (info or {}).get("neto") if info else None
+        order_id = self._current_order_id_for_info(info) if info else None
+        neto = local_store.get_neto_manual(order_id) if order_id else None
 
         if costo_unitario is None or neto is None:
+            faltan = []
+            if costo_unitario is None:
+                faltan.append("FOB/multiplicador")
+            if neto is None:
+                faltan.append("neto MP")
             ttk.Label(
                 frame,
-                text="(faltan datos para calcular)",
+                text=f"(falta {' + '.join(faltan)})" if faltan else "(faltan datos)",
                 foreground="#888",
             ).pack(anchor="w")
             return
@@ -980,7 +1089,7 @@ class VentasApp:
         if self._solo_con_nota_var.get():
             self._refresh_tree_filter()
 
-    def _render_costo(self, sku: str | None):
+    def _render_costo(self, sku: str | None, info: dict | None = None):
         frame = self.detail_costo_frame
         if not sku:
             ttk.Label(
@@ -1055,36 +1164,57 @@ class VentasApp:
         self._last_costo_unitario = precio_final
 
         rows = [
-            (f"FOB unitario", f"USD {fob:,.2f}", "#1a3a5c", False),
-            (f"FOB total (×{mult})", f"USD {fob_total:,.2f}", "#1a3a5c", False),
+            (f"FOB unitario", f"USD {fob:,.2f}", "#1a3a5c"),
+            (f"FOB total (×{mult})", f"USD {fob_total:,.2f}", "#1a3a5c"),
             (f"Nacionalizado (×{NACIONALIZACION_MULT})",
-             f"USD {nacionalizado_usd:,.2f}", "#1a3a5c", False),
+             f"USD {nacionalizado_usd:,.2f}", "#1a3a5c"),
             (f"En pesos (×${cot:,.0f})",
-             format_price(costo_pesos), "#1a3a5c", False),
-            (f"+ ganancia (×{GANANCIA_HERMANO_MULT})",
-             format_price(precio_final), "#1e7a1e", True),
+             format_price(costo_pesos), "#1a3a5c"),
         ]
-        for label, value, color, is_total in rows:
+        for label, value, color in rows:
             row = ttk.Frame(frame)
             row.pack(fill="x", anchor="w", pady=1)
-            if is_total:
-                tk.Label(
-                    row,
-                    text="pagar a Andrés →",
-                    foreground="#c0392b",
-                    font=("TkDefaultFont", 12, "bold"),
-                ).pack(side="left")
-                tk.Label(
-                    row,
-                    text=value,
-                    foreground="#c0392b",
-                    font=("TkDefaultFont", 12, "bold", "underline"),
-                ).pack(side="right")
-            else:
-                ttk.Label(row, text=label, font=("TkDefaultFont", 10)).pack(side="left")
-                tk.Label(
-                    row, text=value, foreground=color, font=("TkDefaultFont", 10)
-                ).pack(side="right")
+            ttk.Label(row, text=label, font=("TkDefaultFont", 10)).pack(side="left")
+            tk.Label(
+                row, text=value, foreground=color, font=("TkDefaultFont", 10)
+            ).pack(side="right")
+
+        # ── Pagar a Andrés: individual + total (×cant). Si cant=1 son iguales. ──
+        try:
+            quantity = int((info or {}).get("quantity") or 1)
+        except (TypeError, ValueError):
+            quantity = 1
+        precio_total = precio_final * quantity
+
+        row_ind = ttk.Frame(frame)
+        row_ind.pack(fill="x", anchor="w", pady=(4, 1))
+        tk.Label(
+            row_ind,
+            text="Pagar a Andrés individual:",
+            foreground="#7d3c98",
+            font=("TkDefaultFont", 12, "bold"),
+        ).pack(side="left")
+        tk.Label(
+            row_ind,
+            text=format_price(precio_final),
+            foreground="#7d3c98",
+            font=("TkDefaultFont", 12, "bold", "underline"),
+        ).pack(side="right")
+
+        row_tot = ttk.Frame(frame)
+        row_tot.pack(fill="x", anchor="w", pady=1)
+        tk.Label(
+            row_tot,
+            text=f"Pagar a Andrés total (×{quantity}):",
+            foreground="#c0392b",
+            font=("TkDefaultFont", 12, "bold"),
+        ).pack(side="left")
+        tk.Label(
+            row_tot,
+            text=format_price(precio_total),
+            foreground="#c0392b",
+            font=("TkDefaultFont", 12, "bold", "underline"),
+        ).pack(side="right")
 
     def _on_alt_click(self, event):
         row = self.tree.identify_row(event.y)
@@ -1792,8 +1922,8 @@ class VentasApp:
         """Itera ventas cargadas y checkeadas, devuelve totales.
 
         Solo incluye en el costo/ganancia las ventas con FOB + multiplicador
-        + cotización del dólar disponibles. Las que no, van a `sin_costo` con
-        un motivo para mostrar en el modal de detalle.
+        + cotización del dólar + neto MP manual disponibles. Las que no, van
+        a `sin_costo` con un motivo para mostrar en el modal de detalle.
         """
         bruto = 0.0
         neto_all = 0.0
@@ -1812,7 +1942,9 @@ class VentasApp:
             info = self.leaf_to_item.get(leaf_id) or {}
             count_total += 1
             bruto += float(info.get("total_amount") or 0)
-            neto_all += float(info.get("neto") or 0)
+            neto_manual = local_store.get_neto_manual(order_id)
+            if neto_manual is not None:
+                neto_all += neto_manual
 
             sku = info.get("sku") or ""
             title = info.get("title") or ""
@@ -1821,6 +1953,9 @@ class VentasApp:
             except (TypeError, ValueError):
                 quantity = 1
 
+            if neto_manual is None:
+                sin_costo.append((sku, title, "sin neto MP"))
+                continue
             if not sku:
                 sin_costo.append(("", title, "sin SKU"))
                 continue
@@ -1840,7 +1975,7 @@ class VentasApp:
                 fob * mult * NACIONALIZACION_MULT * cot * GANANCIA_HERMANO_MULT
             )
             costo += costo_unit * quantity
-            neto_calc += float(info.get("neto") or 0)
+            neto_calc += neto_manual
             count_calc += 1
 
         return {
@@ -2741,36 +2876,15 @@ class VentasApp:
                 "order": self._leaf_order_counter,
             }
             self._leaf_order_counter += 1
-            # Datos de pago / comisiones para el panel de detalle
+            # Solo guardamos lo que viene "gratis" en el listado de orders.
+            # No calculamos sale_fee/taxes/shipping/neto: el neto MP se carga
+            # a mano por venta (ver _open_neto_modal y local_store.neto_manual).
             payments = order.get("payments") or []
             first_payment = payments[0] if payments else {}
-            try:
-                sale_fee_unit = float(first.get("sale_fee") or 0)
-            except (TypeError, ValueError):
-                sale_fee_unit = 0.0
-            sale_fee_total = sale_fee_unit * quantity
-            # Heurístico de shipping: NO hacemos llamadas a /shipments.
-            # Si la order tiene shipment y supera el umbral de envío gratis,
-            # asumimos que el seller paga ~SHIPPING_FREE_RATE del total.
-            shipment = order.get("shipping") or {}
-            has_shipment = bool(shipment.get("id"))
-            taxes = order.get("taxes") or {}
-            try:
-                taxes_amount = float(taxes.get("amount") or 0)
-            except (TypeError, ValueError):
-                taxes_amount = 0.0
             try:
                 total_amount = float(order.get("total_amount") or line_total)
             except (TypeError, ValueError):
                 total_amount = line_total
-            if has_shipment and total_amount >= SHIPPING_FREE_THRESHOLD:
-                shipping_cost = round(total_amount * SHIPPING_FREE_RATE, 2)
-            else:
-                shipping_cost = 0.0
-            # Nota: NO restamos coupon_amount. `total_amount` ya es el precio
-            # listado completo; el cupón es un descuento que el marketplace le
-            # devuelve al seller, no un gasto.
-            neto = total_amount - sale_fee_total - shipping_cost - taxes_amount
 
             self.leaf_to_item[leaf_id] = {
                 "item_id": item.get("id", ""),
@@ -2783,10 +2897,6 @@ class VentasApp:
                 "payment_id": first_payment.get("id"),
                 "payment_method": first_payment.get("payment_method_id"),
                 "total_amount": total_amount,
-                "sale_fee": sale_fee_total,
-                "shipping_cost": shipping_cost,
-                "taxes_amount": taxes_amount,
-                "neto": neto,
             }
 
             self.day_count[day_key] = self.day_count.get(day_key, 0) + 1
