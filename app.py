@@ -152,6 +152,10 @@ class VentasApp:
         self._leaves_meta: dict = {}  # leaf_id -> {"day_key", "row_text", "order"}
         self._leaf_order_counter = 0  # contador para preservar orden de inserción
         self._filter_active = False
+        # Cache de costos de envío reales por shipment_id (proceso, no disco).
+        # Lo llena `_refresh_shipping_costs_batch` para evitar re-pegarle a
+        # /shipments/{id}/costs si la misma orden ya pasó por la app.
+        self._shipping_cost_cache: dict = {}
 
         self._build_ui()
         self._cargar_productos_async()
@@ -587,12 +591,14 @@ class VentasApp:
             ("Bruto", info.get("total_amount") or 0, "#1a3a5c"),
             ("Comisión ML", -(info.get("sale_fee") or 0), "#c0392b"),
         ]
-        if info.get("shipping_cost"):
+        # El envío real no viene en el listado de orders — `shipping_loaded`
+        # marca si ya llegó la respuesta de /shipments/{id}/costs.
+        if not info.get("shipping_loaded"):
+            rows.append(("Envío", "cargando…", "#888"))
+        elif info.get("shipping_cost"):
             rows.append(("Envío", -(info.get("shipping_cost") or 0), "#c0392b"))
         if info.get("taxes_amount"):
             rows.append(("Impuestos", -(info.get("taxes_amount") or 0), "#c0392b"))
-        if info.get("coupon_amount"):
-            rows.append(("Cupón", -(info.get("coupon_amount") or 0), "#c0392b"))
         rows.append(("Neto", info.get("neto") or 0, "#1e7a1e"))
 
         for label, value, color in rows:
@@ -615,9 +621,12 @@ class VentasApp:
                 ).pack(side="right")
             else:
                 ttk.Label(row, text=label, font=font).pack(side="left")
+                # `value` puede ser un string (placeholder "cargando…") o un
+                # número. format_price() solo aplica a los números.
+                display = value if isinstance(value, str) else format_price(value)
                 tk.Label(
                     row,
-                    text=format_price(value),
+                    text=display,
                     foreground=color,
                     font=font,
                 ).pack(side="right")
@@ -2654,24 +2663,29 @@ class VentasApp:
             except (TypeError, ValueError):
                 sale_fee_unit = 0.0
             sale_fee_total = sale_fee_unit * quantity
-            try:
-                shipping_cost_num = float(order.get("shipping_cost") or 0)
-            except (TypeError, ValueError):
-                shipping_cost_num = 0.0
+            # `order.shipping_cost` casi siempre viene null en /orders/search.
+            # El costo real del envío para el seller vive en
+            # /shipments/{id}/costs → senders[0].cost. Lo trae
+            # `_refresh_shipping_costs_batch` en background después de cargar
+            # las órdenes; mientras tanto arrancamos en 0 y `shipping_loaded`
+            # marca si ya llegó la respuesta o no.
+            shipment = order.get("shipping") or {}
+            shipment_id = shipment.get("id")
             taxes = order.get("taxes") or {}
             try:
                 taxes_amount = float(taxes.get("amount") or 0)
             except (TypeError, ValueError):
                 taxes_amount = 0.0
             try:
-                coupon_amount = float(first_payment.get("coupon_amount") or 0)
-            except (TypeError, ValueError):
-                coupon_amount = 0.0
-            try:
                 total_amount = float(order.get("total_amount") or line_total)
             except (TypeError, ValueError):
                 total_amount = line_total
-            neto = total_amount - sale_fee_total - shipping_cost_num - taxes_amount - coupon_amount
+            # Nota: NO restamos coupon_amount. `total_amount` ya es el precio
+            # listado completo; el cupón es un descuento que el marketplace le
+            # devuelve al seller, no un gasto. MP lo refleja como "Cobro por
+            # descuento a tu contraparte" (positivo). Antes lo restábamos y eso
+            # generaba la discrepancia con el "Total a recibir" de MP.
+            neto = total_amount - sale_fee_total - taxes_amount
 
             self.leaf_to_item[leaf_id] = {
                 "item_id": item.get("id", ""),
@@ -2685,9 +2699,10 @@ class VentasApp:
                 "payment_method": first_payment.get("payment_method_id"),
                 "total_amount": total_amount,
                 "sale_fee": sale_fee_total,
-                "shipping_cost": shipping_cost_num,
+                "shipment_id": shipment_id,
+                "shipping_cost": 0.0,
+                "shipping_loaded": False,
                 "taxes_amount": taxes_amount,
-                "coupon_amount": coupon_amount,
                 "neto": neto,
             }
 
@@ -2712,6 +2727,13 @@ class VentasApp:
         if new_leaf_ids:
             threading.Thread(
                 target=self._refresh_skus_batch,
+                args=(new_leaf_ids,),
+                daemon=True,
+            ).start()
+            # Mismo patrón para los shipping costs reales (vienen de
+            # /shipments/{id}/costs, no del listado de orders).
+            threading.Thread(
+                target=self._refresh_shipping_costs_batch,
                 args=(new_leaf_ids,),
                 daemon=True,
             ).start()
@@ -2788,6 +2810,79 @@ class VentasApp:
                 self.tree.item(lid, values=values)
             self._refresh_leaf_meta(lid)
         self._flash_status(f"SKUs sincronizados ({len(updates)})")
+
+    def _refresh_shipping_costs_batch(self, leaf_ids: list):
+        """Trae el costo real del envío para cada leaf desde
+        /shipments/{id}/costs y actualiza el neto en el main thread.
+
+        El listado de orders no trae el shipping_cost real (siempre viene null
+        o 0). Hacemos 1 request por shipment_id único, en paralelo con un pool
+        chico para no martillar la API. Cache de proceso así si recargamos no
+        repetimos los mismos shipments.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        # leaf_id → shipment_id (solo los que faltan resolver)
+        pendientes: list[tuple[str, int]] = []
+        for lid in leaf_ids:
+            info = self.leaf_to_item.get(lid) or {}
+            if info.get("shipping_loaded"):
+                continue
+            sid = info.get("shipment_id")
+            if not sid:
+                # Sin envío → loaded con cost 0, marcamos para no reintentar.
+                self.root.after(0, self._on_shipping_cost_loaded, lid, 0.0)
+                continue
+            cached = self._shipping_cost_cache.get(sid)
+            if cached is not None:
+                self.root.after(0, self._on_shipping_cost_loaded, lid, cached)
+                continue
+            pendientes.append((lid, sid))
+
+        if not pendientes:
+            return
+
+        def fetch_one(args):
+            lid, sid = args
+            try:
+                url = f"https://api.mercadolibre.com/shipments/{sid}/costs"
+                req = Request(
+                    url,
+                    headers={"Authorization": f"Bearer {self.auth.access_token}"},
+                )
+                with urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                senders = data.get("senders") or []
+                cost = float((senders[0] or {}).get("cost") or 0) if senders else 0.0
+            except Exception:
+                cost = 0.0
+            self._shipping_cost_cache[sid] = cost
+            self.root.after(0, self._on_shipping_cost_loaded, lid, cost)
+
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            list(ex.map(fetch_one, pendientes))
+
+    def _on_shipping_cost_loaded(self, leaf_id: str, cost: float):
+        """Callback main-thread: aplica el shipping cost a una venta y
+        recalcula el neto. Refresca panel de detalle si la fila está
+        seleccionada y actualiza el mini totalizador."""
+        info = self.leaf_to_item.get(leaf_id)
+        if info is None:
+            return
+        info["shipping_cost"] = cost
+        info["shipping_loaded"] = True
+        info["neto"] = (
+            float(info.get("total_amount") or 0)
+            - float(info.get("sale_fee") or 0)
+            - cost
+            - float(info.get("taxes_amount") or 0)
+        )
+        # Si la fila afectada es la seleccionada, redibujamos el panel.
+        sel = self.tree.selection()
+        if sel and sel[0] == leaf_id:
+            self._on_select()
+        # El mini totalizador iteraba el neto viejo; refrescarlo.
+        self._update_totales_inline()
 
     def _get_or_create_day(self, day_key: str) -> str:
         if day_key in self.day_nodes:
