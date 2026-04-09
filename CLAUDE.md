@@ -1,6 +1,6 @@
 # ventas-ml — contexto para Claude
 
-App Tkinter en Python que lista las ventas de MercadoLibre (cuenta PaliShopping, USER_ID 24192412) en vivo, agrupadas por día. Panel lateral con detalle del producto, costeo de importación FOB → precio final → ganancia neta sobre cobro de Mercado Pago, filtro de búsqueda/exclusión sobre el listado, modal de totales seleccionados con filas clicables para copiar al portapapeles, y un modal extra de "Frase del día" que llama a la API de Anthropic on-demand y permite enviarse la frase por WhatsApp. Pensada para uso interno del vendedor.
+App Tkinter en Python que lista las ventas de MercadoLibre (cuenta PaliShopping, USER_ID 24192412) en vivo, agrupadas por día. Panel lateral con detalle del producto, costeo de importación FOB → precio final → ganancia neta sobre cobro de Mercado Pago, margen porcentual con chip de "BAJO/BUENO/EXCELENTE", chips diferenciando envío Flex (Héctor) vs Mercado Envíos, filtro de búsqueda/exclusión sobre el listado, modal de totales seleccionados con filas clicables para copiar al portapapeles, y un modal extra de "Frase del día" que llama a la API de Anthropic on-demand y permite enviarse la frase por WhatsApp. Pensada para uso interno del vendedor.
 
 ## Dependencias externas (críticas)
 
@@ -50,7 +50,7 @@ values = (check, fecha, sku, cant, producto, precio, subtotal)
 
 Tres estructuras paralelas que hacen cosas distintas — confundirlas rompe los totales y el filtro:
 
-- **`leaf_to_item[leaf_id]`** — datos por venta que no están en `values`: `item_id`, `variation_id`, `quantity`, `unit_price`, `line_total`, `payment_id`, `payment_method`, `total_amount`, `sale_fee`, `shipping_cost`, `taxes_amount`, `coupon_amount`, `neto`, `title`. Cuando agregues funcionalidad por venta, **usá esto** en vez de re-parsear `values`.
+- **`leaf_to_item[leaf_id]`** — datos por venta que no están en `values`: `item_id`, `variation_id`, `quantity`, `unit_price`, `line_total`, `payment_id`, `payment_method`, `total_amount`, `sale_fee`, `shipment_id`, `shipping_cost`, `shipping_loaded` (flag), `logistic_type`, `pago_hector`, `taxes_amount`, `neto`, `title`. Cuando agregues funcionalidad por venta, **usá esto** en vez de re-parsear `values`. Notar que `coupon_amount` ya NO está — se eliminó del cálculo del neto al descubrir que `total_amount` ya incluye el listado completo (ver sección "Cálculo del neto MP" más abajo).
 - **`row_to_order[leaf_id] → order_id`** — TODAS las leaves cargadas, incluso las **detached** por el filtro. Usar para totales/conteos que no deben depender del filtro.
 - **`_all_leaves()`** — solo las leaves **visibles** en el tree (excluye detached). Usar para conteos visuales (ej. "X de Y mostradas").
 - **`_leaves_meta[leaf_id]`** — tracking del filtro: `day_key`, `row_text` normalizado, `order` (contador para preservar orden de inserción).
@@ -74,9 +74,17 @@ Hay **3 lugares** donde un SKU puede cambiar en runtime: `_on_sku_updated` (moda
 
 El constraint "no podés tener multiplicador sin FOB" vive en código (`set_multiplicador` hace `UPDATE ... WHERE sku = ?` y verifica `affected_row_count > 0`), no en SQL. Si querés relajarlo, recordá actualizar también `_on_ctrl_shift_alt_click` que valida lo mismo antes de abrir el modal.
 
-### Constantes del cálculo de FOB hardcodeadas
+### Constantes comerciales hardcodeadas al tope de `app.py`
 
-`NACIONALIZACION_MULT = 1.9` y `GANANCIA_HERMANO_MULT = 1.30` están al tope de `app.py`. Si los multiplicadores cambian (ej. el hermano sube su markup a 35%), se editan ahí. **No están en Turso a propósito** — son políticas del usuario, no del catálogo. Si la app se compartiera entre múltiples vendedores, ahí sí habría que moverlas a config por usuario.
+```python
+NACIONALIZACION_MULT = 1.9     # impuestos importación China
+GANANCIA_HERMANO_MULT = 1.30   # markup que cobra Andrés
+PAGO_HECTOR_FLEX = 6500.0      # promedio que paga Pablo a Héctor por entrega Flex
+```
+
+Si los multiplicadores cambian (ej. Andrés sube su markup a 35%, Héctor cambia tarifa, cambian las alícuotas de importación), se editan ahí. **No están en Turso a propósito** — son políticas del usuario, no del catálogo. Si la app se compartiera entre múltiples vendedores, ahí sí habría que moverlas a config por usuario.
+
+`PAGO_HECTOR_FLEX` arrancó como aproximación; cuando Pablo confirme el número exacto (o pase una regla por zona/peso) hay que actualizar el valor o, si la regla es compleja, refactorear a una función `calcular_pago_hector(shipping_data) → float` y llamarla desde `_on_shipping_cost_loaded`.
 
 ### Bindings de modificadores
 
@@ -94,9 +102,100 @@ Hay 6 acciones distintas según qué tecla pretás al hacer click:
 
 Cada combinación tiene su binding propio en `_build_ui` y devuelve `"break"` para no propagar al `_on_click` de toggle. Si agregás una combinación nueva, sumá también un branch en `_refresh_modifier_hint` o el hint de la status bar queda mudo.
 
-### URL del cobro de Mercado Pago
+### URL del cobro de Mercado Pago — buscar por payment_id, NO order_id
 
-Alt+click abre `https://www.mercadopago.com.ar/activities?q={order_id}` (búsqueda) en vez del detalle directo. **No es por flojera** — el endpoint `/activities/detail/{id}` requiere un hash `purchase_v3-{...}` impredecible que solo conoce el frontend de MP. La búsqueda es la forma confiable.
+Alt+click abre `https://www.mercadopago.com.ar/activities?q={payment_id}` (búsqueda) en vez del detalle directo (`/activities/detail/{id}` requiere un hash `purchase_v3-{...}` impredecible que solo conoce el frontend de MP).
+
+**Bug histórico**: antes pasábamos `order_id` al search de MP. A veces matcheaba (cuando MP había indexado la relación) y a veces tiraba "No encontramos resultados" en órdenes válidas. **El search de MP busca por su ID nativo (`payment_id`), no por el `order_id` de ML.** La función `_on_alt_click` lee `info["payment_id"]` con fallback al `order_id` por seguridad. Si lo "limpiás" volviendo al order_id directo, la mitad de los Alt+clicks van a fallar.
+
+### Cálculo del neto MP — qué se resta y qué NO
+
+Fórmula actual del `neto` en `_on_data` (inicial) y `_on_shipping_cost_loaded` (final):
+
+```python
+neto = total_amount - sale_fee - shipping_cost - taxes_amount - pago_hector
+```
+
+**Lo que NO restamos** (y por qué):
+
+- **`coupon_amount` NO se resta**. Bug histórico: antes lo restábamos y daba ~$1k de menos por orden con cupón. `total_amount` ya es el precio listado completo; el cupón es un crédito que el marketplace le devuelve al seller (MP lo muestra como "Cobro por descuento a tu contraparte" positivo), no un gasto. **No volver a restarlo.**
+- **Retenciones IIBB (Tucumán + SIRTAC + otras provincias)**: ML/MP no las exponen en ningún endpoint del API público. Son retenciones impositivas que MP aplica al liquidar y dependen de la jurisdicción del comprador y del padrón en cada provincia (cambia mes a mes). **Aceptamos una diferencia residual de ~0.5%** entre el "Ganancia Mercado Pago" del app y el "Total a recibir" real de MP por este motivo.
+
+**De dónde sale cada componente** (importante porque los endpoints son varios):
+
+| Campo | Endpoint | Path JSON |
+|---|---|---|
+| `total_amount` | `/orders/search` | `order.total_amount` |
+| `sale_fee` | `/orders/search` | `order.order_items[0].sale_fee × quantity` (incluye TODO: cargo por vender + costo fijo + costo cuotas) |
+| `shipping_cost` | `/shipments/{id}/costs` | `senders[0].cost` (background) |
+| `logistic_type` | `/shipments/{id}` | `logistic_type` (background, mismo batch) |
+| `taxes_amount` | `/orders/search` | `order.taxes.amount` (viene null casi siempre) |
+| `pago_hector` | constante en código | `PAGO_HECTOR_FLEX` (solo si Flex) |
+
+`order.shipping_cost` directo viene **siempre null** en `/orders/search` — no usar ese campo. El cost real al seller siempre va por `/shipments/{id}/costs`.
+
+### Shipping cost en background con dos endpoints + cache
+
+`/orders/search` no trae el shipping cost real del seller, así que `_refresh_shipping_costs_batch` lo trae aparte después de cargar las orders. Hace **DOS requests por shipment_id único**:
+
+1. `/shipments/{id}/costs` → `senders[0].cost` (lo que ML le cobra al seller)
+2. `/shipments/{id}` → `logistic_type` (para detectar Flex / `self_service`)
+
+ThreadPoolExecutor con 8 workers en paralelo. **Cache de proceso** en `self._shipping_cost_cache: dict[shipment_id → (cost, logistic_type)]` para no repetir nunca el par. Cuando llega cada respuesta, callback `_on_shipping_cost_loaded` recalcula `info["neto"]`, redibuja el panel si la fila está seleccionada, y refresca el mini totalizador (los netos van bajando en vivo a medida que llegan).
+
+**Convención del flag `shipping_loaded`** (importante):
+- Arranca en `False`, `shipping_cost = 0`. Mientras está en False, el panel muestra "Envío: cargando…" en gris.
+- Cuando llega el cost se setea en `True` y se recalcula el neto.
+- **NO usar `shipping_cost == 0` para distinguir "no cargado" de "cargado pero envío gratis"** — los dos casos son válidos. Siempre mirar el flag.
+
+### Bonificación Flex no se puede capturar del API público de ML
+
+En órdenes Flex (`logistic_type == "self_service"` con `shipping_cost == 0`), MP le suma al seller una **bonificación por el envío** que **no aparece en ningún endpoint del API público de ML**. Probé y descarté: `/orders/{id}`, `/orders/{id}/billing_info`, `/orders/{id}/discounts`, `/shipments/{id}`, `/shipments/{id}/costs`, `/shipments/{id}/charges`, `/shipments/{id}/compensations`, `/shipments/{id}/lead_time`, `/packs/{pack_id}`, `/billing/integration/group/MLA/details`, `/sites/MLA/shipping/options/{id}`. Algunos 404, los que responden no traen el monto.
+
+La bonificación probablemente vive en el sistema de billing/liquidación de Mercado Pago (no Mercado Libre), y para sacarla habría que pedir scope `read_billing_info` en el OAuth y parsear los reportes mensuales. **Decisión explícita: NO ir por ese camino** — es mucho laburo, no garantizado, y la app ya tiene una alternativa pragmática (ver siguiente).
+
+### Pago a Héctor en ventas Flex (constante, NO heurística)
+
+Para órdenes Flex Pablo paga afuera a "Héctor" por hacer la entrega. Eso es un costo real que ML/MP no expone, así que se modela como constante:
+
+```python
+PAGO_HECTOR_FLEX = 6500.0  # promedio inicial al tope de app.py
+```
+
+Se aplica **solo cuando `logistic_type == "self_service"` Y `shipping_cost == 0`** (la definición operacional de "es Flex"), en `_on_shipping_cost_loaded`. Aparece como línea propia "Pago Héctor (Flex)" en el panel.
+
+**Por qué constante y no heurística**: cuando la sesión empezó a explorar formas de "estimar" la bonificación Flex que MP suma, se decidió explícitamente NO inventar un número (heurística) porque te lleva a sobre-confianza en datos falsos. En cambio se modela el costo de Héctor (que vos sí conocés) y se avisa visualmente con el chip que la bonificación queda fuera. El número final es deliberadamente **conservador**: subestima el real, lo cual es mejor para tomar decisiones de precio (asumir lo peor).
+
+**Limitación conocida — carrito multi-unidad del mismo comprador**: cuando un buyer compra N unidades del mismo SKU, ML lo desarma en N orders separadas (cada una con su shipment_id distinto). La app resta `N × $6,500` aunque Héctor probablemente solo cobre 1 entrega (lleva las N unidades en un viaje al mismo domicilio). Es un edge case (B2B / revendedores) y se identifica visualmente porque ves N filas seguidas con mismo SKU, hora y precio. **No detectamos ni agrupamos automáticamente** porque correlacionar por buyer + día + dirección agrega complejidad y solo aplica al ~5% de las ventas. Pablo lo maneja a ojo.
+
+### Caso "carrito de N unidades del mismo SKU"
+
+Cuando un comprador hace una compra de varias unidades en un solo carrito, ML lo divide en **N órdenes separadas con `pack_id` distintos** y cada una con su propio `shipment_id` y `payment_id`. La app las muestra como N filas en el tree (correcto desde la perspectiva del API). MP agrupa esas N órdenes en un solo cobro a nivel de **frontend** con un ID `purchase_v3-{hash}`, pero ese hash **no está expuesto en el API** — la página `/activities/detail/purchase_v3-...` que ves al hacer Alt+click se renderiza del lado del frontend de MP a partir de la búsqueda por payment_id.
+
+Implicancias:
+- El `_calcular_totales_seleccionados` suma N veces el neto y N veces el costo, lo cual es contablemente correcto.
+- Si las N son Flex, suma N veces `PAGO_HECTOR_FLEX` (ver limitación arriba).
+- No hay forma de "agrupar visualmente" estas N filas en una sola sin perder datos. **Decidir explícitamente NO agrupar.**
+
+### Chips de tipo de envío y de margen — son señalización, no decoración
+
+`_render_payment` muestra **uno de dos chips** según `logistic_type`:
+
+- **`⚡ Flex (Héctor descontado)`** (naranja `#d35400`) cuando es self_service + cost 0. Avisa que el cálculo ya restó el promedio a Héctor pero **no incluye la bonificación** que MP suma al seller.
+- **`📦 Mercado Envíos`** (azul `#1f4e9d`) cuando ML maneja el envío. Cálculo confiable: el cost al seller ya está descontado en la línea "Envío" del panel.
+
+`_render_ganancia` muestra el chip de margen sobre el bruto (`ganancia / total_amount × 100`):
+
+| Margen | Chip | Color |
+|---|---|---|
+| < 10% | **MUY BAJO** | `#c0392b` rojo |
+| 10-20% | **BAJO** | `#d35400` naranja |
+| 20-30% | **BUENO** | `#1e7a1e` verde |
+| > 30% | **EXCELENTE** | `#7d3c98` violeta |
+
+**Los umbrales son aproximados para revendedores de importación en ML Argentina**, no son universales. Si Pablo cambia de rubro o estrategia, son los primeros números a revisar.
+
+**Importante: NO simplificar a un solo chip "tipo envío"** — la diferencia entre "cálculo confiable (Mercado Envíos)" y "cálculo con dos componentes ciegos (Flex)" es justo la información valiosa. Tampoco renombrar los chips con nombres genéricos: el texto "Héctor descontado" / "Mercado Envíos" es lo que comunica al usuario qué confianza tener en el número.
 
 ### Emojis no se rinden en Tk-Linux — la frase usa PIL
 
