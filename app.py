@@ -185,8 +185,20 @@ class VentasApp:
             background=_fixed_map("background"),
         )
 
-        container = ttk.Frame(self.root, padding=10)
-        container.pack(fill="both", expand=True)
+        # Notebook con dos pestañas: "Ventas" (todo lo de siempre) y
+        # "Consolidados" (sección manual e independiente). El status_var y
+        # dolar_var quedan en el bottom de la pestaña Ventas — _flash_status
+        # sigue funcionando, sólo que cuando estás en Consolidados los
+        # mensajes no se ven (limitación menor, asumida).
+        self.notebook = ttk.Notebook(self.root, padding=6)
+        self.notebook.pack(fill="both", expand=True)
+
+        container = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(container, text="Ventas")
+
+        consolidados_tab = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(consolidados_tab, text="Consolidados")
+        self._consolidados_tab = consolidados_tab
 
         paned = ttk.PanedWindow(container, orient="horizontal")
         paned.pack(fill="both", expand=True)
@@ -435,6 +447,9 @@ class VentasApp:
         )
         self.btn_totales.pack(side="right", padx=(0, 6))
 
+        # Pestaña Consolidados (independiente de las ventas).
+        self._build_consolidados_tab()
+
     def _build_detail_panel(self):
         ttk.Label(
             self.detail_frame,
@@ -597,6 +612,443 @@ class VentasApp:
             text="📄 Copiar informe lite",
             command=self._copy_informe_lite,
         ).pack(side="left", padx=(8, 0))
+
+    # ──────────────────── Pestaña Consolidados ────────────────────
+    # Sección 100% manual e independiente. Cada tarjeta es una "consolidación
+    # de pago" entre Pablo y Andrés. Persiste en data.json bajo "consolidados"
+    # y se sube al repo como el resto de los datos.
+
+    CONSOLIDADOS_COLS = 3  # cards por fila en el grid
+
+    def _build_consolidados_tab(self):
+        tab = self._consolidados_tab
+
+        # ─── Top bar: nuevo + filtro ───
+        topbar = ttk.Frame(tab)
+        topbar.pack(fill="x", pady=(0, 8))
+
+        ttk.Button(
+            topbar,
+            text="➕ Nuevo consolidado",
+            command=lambda: self._open_consolidado_modal(None),
+        ).pack(side="left")
+
+        self._consol_solo_activos = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            topbar,
+            text="Solo activos",
+            variable=self._consol_solo_activos,
+            command=self._refresh_consolidados,
+        ).pack(side="left", padx=(12, 0))
+
+        ttk.Label(
+            topbar,
+            text="(click en una tarjeta para editar)",
+            foreground="#888",
+            font=("TkDefaultFont", 9, "italic"),
+        ).pack(side="left", padx=(16, 0))
+
+        # ─── Área scrolleable con los cards ───
+        # Canvas + Frame interno + Scrollbar — patrón clásico de Tk para
+        # listas de widgets de altura variable.
+        canvas_outer = ttk.Frame(tab)
+        canvas_outer.pack(fill="both", expand=True)
+
+        self._consol_canvas = tk.Canvas(
+            canvas_outer, highlightthickness=0, borderwidth=0
+        )
+        consol_vsb = ttk.Scrollbar(
+            canvas_outer, orient="vertical", command=self._consol_canvas.yview
+        )
+        self._consol_canvas.configure(yscrollcommand=consol_vsb.set)
+        consol_vsb.pack(side="right", fill="y")
+        self._consol_canvas.pack(side="left", fill="both", expand=True)
+
+        self._consol_grid_frame = ttk.Frame(self._consol_canvas)
+        self._consol_grid_window = self._consol_canvas.create_window(
+            (0, 0), window=self._consol_grid_frame, anchor="nw"
+        )
+
+        self._consol_grid_frame.bind(
+            "<Configure>",
+            lambda e: self._consol_canvas.configure(
+                scrollregion=self._consol_canvas.bbox("all")
+            ),
+        )
+        self._consol_canvas.bind(
+            "<Configure>",
+            lambda e: self._consol_canvas.itemconfig(
+                self._consol_grid_window, width=e.width
+            ),
+        )
+
+        # Mouse wheel sobre el canvas (Linux usa Button-4/5).
+        def _on_wheel(event):
+            if event.num == 4 or getattr(event, "delta", 0) > 0:
+                self._consol_canvas.yview_scroll(-3, "units")
+            else:
+                self._consol_canvas.yview_scroll(3, "units")
+
+        def _bind_wheel(_e):
+            self._consol_canvas.bind_all("<MouseWheel>", _on_wheel)
+            self._consol_canvas.bind_all("<Button-4>", _on_wheel)
+            self._consol_canvas.bind_all("<Button-5>", _on_wheel)
+
+        def _unbind_wheel(_e):
+            self._consol_canvas.unbind_all("<MouseWheel>")
+            self._consol_canvas.unbind_all("<Button-4>")
+            self._consol_canvas.unbind_all("<Button-5>")
+
+        self._consol_canvas.bind("<Enter>", _bind_wheel)
+        self._consol_canvas.bind("<Leave>", _unbind_wheel)
+
+        self._refresh_consolidados()
+
+    def _refresh_consolidados(self):
+        """Reconstruye el grid de cards desde local_store. Newest top-right,
+        fillea derecha→izquierda, wrap a la fila siguiente."""
+        # Limpiar contenido previo
+        for w in self._consol_grid_frame.winfo_children():
+            w.destroy()
+
+        consolidados = local_store.list_consolidados()
+        if self._consol_solo_activos.get():
+            consolidados = [c for c in consolidados if c.get("activo", True)]
+
+        # Newest first: orden por fecha_creacion desc, fallback por orden inverso
+        # de inserción (los más nuevos del array primero).
+        consolidados.sort(
+            key=lambda c: (c.get("fecha_creacion") or ""), reverse=True
+        )
+
+        if not consolidados:
+            ttk.Label(
+                self._consol_grid_frame,
+                text="(no hay consolidados — clickeá '➕ Nuevo consolidado' para empezar)",
+                foreground="#888",
+                font=("TkDefaultFont", 10, "italic"),
+                padding=20,
+            ).pack(anchor="center")
+            return
+
+        cols = self.CONSOLIDADOS_COLS
+        for i, c in enumerate(consolidados):
+            row = i // cols
+            # Right-to-left fill: el primero (más nuevo) va a la derecha.
+            col = (cols - 1) - (i % cols)
+            card = self._make_consolidado_card(self._consol_grid_frame, c)
+            card.grid(
+                row=row, column=col, padx=8, pady=8, sticky="nsew"
+            )
+        # Que las columnas se distribuyan equitativamente.
+        for col in range(cols):
+            self._consol_grid_frame.grid_columnconfigure(col, weight=1, uniform="cols")
+
+    def _make_consolidado_card(self, parent, c: dict) -> tk.Widget:
+        """Construye un card visual para un consolidado dado. Retorna el frame."""
+        # Estilo: borde sólido, fondo blanco si activo, gris si inactivo.
+        bg = "#ffffff" if c.get("activo", True) else "#ececec"
+        card = tk.Frame(
+            parent,
+            relief="solid",
+            borderwidth=1,
+            background=bg,
+            padx=10,
+            pady=10,
+        )
+
+        cid = c.get("id", "")
+        monto_deuda = float(c.get("monto_deuda") or 0)
+        credito = float(c.get("credito") or 0)
+        neto = monto_deuda - credito
+        activo = c.get("activo", True)
+        facturado = c.get("facturado", False)
+
+        # ─── Header: fecha creación + botón ✕ ───
+        header = tk.Frame(card, background=bg)
+        header.pack(fill="x")
+        tk.Label(
+            header,
+            text=f"📅 Creado: {c.get('fecha_creacion') or '—'}",
+            background=bg,
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(side="left")
+        tk.Button(
+            header,
+            text="✕",
+            command=lambda i=cid: self._delete_consolidado(i),
+            relief="flat",
+            background=bg,
+            foreground="#c0392b",
+            borderwidth=0,
+            cursor="hand2",
+            font=("TkDefaultFont", 11, "bold"),
+        ).pack(side="right")
+
+        tk.Frame(card, background="#bbb", height=1).pack(fill="x", pady=(6, 6))
+
+        # ─── Período ───
+        periodo_txt = (
+            f"📆 Período: {c.get('fecha_desde') or '—'}  →  {c.get('fecha_hasta') or '—'}"
+        )
+        tk.Label(
+            card,
+            text=periodo_txt,
+            background=bg,
+            anchor="w",
+            justify="left",
+            font=("TkDefaultFont", 10),
+        ).pack(fill="x", pady=(0, 4))
+
+        # ─── Fecha de pago (RESALTADA en rojo si activo) ───
+        pago_txt = c.get("fecha_pago") or "(sin fecha)"
+        pago_lbl = tk.Label(
+            card,
+            text=f"💸 Fecha de pago: {pago_txt}",
+            background=bg,
+            foreground="#c0392b" if activo else "#666",
+            anchor="w",
+            justify="left",
+            font=("TkDefaultFont", 11, "bold"),
+        )
+        pago_lbl.pack(fill="x", pady=(0, 6))
+
+        tk.Frame(card, background="#bbb", height=1).pack(fill="x", pady=(0, 6))
+
+        # ─── Montos ───
+        def money_row(label, value, color):
+            r = tk.Frame(card, background=bg)
+            r.pack(fill="x", pady=1)
+            tk.Label(
+                r, text=label, background=bg, font=("TkDefaultFont", 10)
+            ).pack(side="left")
+            tk.Label(
+                r,
+                text=format_price(value),
+                background=bg,
+                foreground=color,
+                font=("TkDefaultFont", 10, "bold"),
+            ).pack(side="right")
+
+        money_row("Le debo a Andrés:", monto_deuda, "#c0392b")
+        if credito:
+            money_row("− Crédito (Andrés→yo):", credito, "#1e7a1e")
+
+        tk.Frame(card, background="#bbb", height=1).pack(fill="x", pady=(6, 4))
+
+        neto_row = tk.Frame(card, background=bg)
+        neto_row.pack(fill="x", pady=(2, 6))
+        tk.Label(
+            neto_row,
+            text="Neto a pagar:",
+            background=bg,
+            font=("TkDefaultFont", 11, "bold"),
+        ).pack(side="left")
+        tk.Label(
+            neto_row,
+            text=format_price(neto),
+            background=bg,
+            foreground="#1f4e9d",
+            font=("TkDefaultFont", 12, "bold", "underline"),
+        ).pack(side="right")
+
+        # ─── Nota libre ───
+        nota_txt = c.get("nota") or ""
+        if nota_txt:
+            tk.Label(
+                card,
+                text=f"📝 {nota_txt}",
+                background=bg,
+                foreground="#7d3c98",
+                wraplength=240,
+                justify="left",
+                anchor="w",
+                font=("TkDefaultFont", 9, "italic"),
+            ).pack(fill="x", pady=(2, 6))
+
+        # ─── Checks: Activo + Facturado ───
+        checks_row = tk.Frame(card, background=bg)
+        checks_row.pack(fill="x", pady=(4, 0))
+
+        activo_var = tk.BooleanVar(value=activo)
+        def toggle_activo(i=cid, v=activo_var):
+            local_store.update_consolidado(i, activo=v.get())
+            self._refresh_consolidados()
+        tk.Checkbutton(
+            checks_row,
+            text="✅ Activo",
+            variable=activo_var,
+            command=toggle_activo,
+            background=bg,
+            activebackground=bg,
+            font=("TkDefaultFont", 9),
+        ).pack(side="left")
+
+        fact_var = tk.BooleanVar(value=facturado)
+        def toggle_fact(i=cid, v=fact_var):
+            local_store.update_consolidado(i, facturado=v.get())
+            self._refresh_consolidados()
+        tk.Checkbutton(
+            checks_row,
+            text="🧾 Facturado",
+            variable=fact_var,
+            command=toggle_fact,
+            background=bg,
+            activebackground=bg,
+            font=("TkDefaultFont", 9),
+        ).pack(side="left", padx=(8, 0))
+
+        # Click en el card (en cualquier parte que no sea botón/check) → editar.
+        def open_edit(_e=None, i=cid):
+            self._open_consolidado_modal(i)
+
+        # Bindear a card y sus children "estáticos" (no a botones/checks).
+        for w in (card, header, pago_lbl, neto_row):
+            w.bind("<Button-1>", open_edit)
+        card.configure(cursor="hand2")
+
+        return card
+
+    def _delete_consolidado(self, cid: str):
+        if not cid:
+            return
+        c = local_store.get_consolidado(cid)
+        if not c:
+            return
+        # Confirmación porque borrar es destructivo
+        ok = messagebox.askyesno(
+            "Borrar consolidado",
+            f"¿Borrar el consolidado del {c.get('fecha_creacion') or '—'}?\n"
+            f"Le debo a Andrés: {format_price(c.get('monto_deuda') or 0)}\n\n"
+            "Esto no se puede deshacer.",
+            parent=self.root,
+        )
+        if not ok:
+            return
+        local_store.delete_consolidado(cid)
+        self._refresh_consolidados()
+
+    def _open_consolidado_modal(self, cid: str | None):
+        """Modal de alta o edición. Si cid es None es alta nueva."""
+        existing = local_store.get_consolidado(cid) if cid else None
+
+        win = tk.Toplevel(self.root)
+        win.title("Editar consolidado" if existing else "Nuevo consolidado")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        frame = ttk.Frame(win, padding=15)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text="Editar consolidado" if existing else "Nuevo consolidado",
+            font=("TkDefaultFont", 11, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 12))
+
+        # Campos: cada uno (label, entry).
+        # Las fechas son texto libre (formato YYYY-MM-DD recomendado pero
+        # sin validación rígida — Pablo escribe lo que quiera).
+        labels = [
+            ("Fecha creación", "fecha_creacion"),
+            ("Fecha desde", "fecha_desde"),
+            ("Fecha hasta", "fecha_hasta"),
+            ("Fecha de pago", "fecha_pago"),
+            ("Le debo a Andrés ($)", "monto_deuda"),
+            ("Crédito Andrés→yo ($)", "credito"),
+            ("Nota", "nota"),
+        ]
+        vars_map: dict[str, tk.StringVar] = {}
+        for i, (lbl, key) in enumerate(labels, start=1):
+            ttk.Label(frame, text=lbl + ":").grid(
+                row=i, column=0, sticky="w", padx=(0, 8), pady=2
+            )
+            initial = ""
+            if existing:
+                v = existing.get(key)
+                if v is not None and v != "":
+                    if isinstance(v, float):
+                        initial = f"{v:g}"
+                    else:
+                        initial = str(v)
+            var = tk.StringVar(value=initial)
+            vars_map[key] = var
+            ttk.Entry(frame, textvariable=var, width=28).grid(
+                row=i, column=1, sticky="ew", pady=2
+            )
+
+        # Checks
+        activo_var = tk.BooleanVar(
+            value=bool(existing.get("activo", True)) if existing else True
+        )
+        ttk.Checkbutton(
+            frame, text="✅ Activo", variable=activo_var
+        ).grid(row=len(labels) + 1, column=0, columnspan=2, sticky="w", pady=(8, 0))
+
+        facturado_var = tk.BooleanVar(
+            value=bool(existing.get("facturado", False)) if existing else False
+        )
+        ttk.Checkbutton(
+            frame, text="🧾 Facturado", variable=facturado_var
+        ).grid(row=len(labels) + 2, column=0, columnspan=2, sticky="w")
+
+        btns = ttk.Frame(frame)
+        btns.grid(row=len(labels) + 3, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+
+        def parse_money(raw: str) -> float:
+            raw = (raw or "").strip().replace(",", ".")
+            if raw == "":
+                return 0.0
+            return float(raw)
+
+        def do_save():
+            try:
+                data = {
+                    "fecha_creacion": vars_map["fecha_creacion"].get().strip(),
+                    "fecha_desde": vars_map["fecha_desde"].get().strip(),
+                    "fecha_hasta": vars_map["fecha_hasta"].get().strip(),
+                    "fecha_pago": vars_map["fecha_pago"].get().strip(),
+                    "monto_deuda": parse_money(vars_map["monto_deuda"].get()),
+                    "credito": parse_money(vars_map["credito"].get()),
+                    "nota": vars_map["nota"].get().strip(),
+                    "activo": activo_var.get(),
+                    "facturado": facturado_var.get(),
+                }
+            except ValueError:
+                messagebox.showerror(
+                    "Error", "Los montos deben ser números válidos.", parent=win
+                )
+                return
+
+            try:
+                if existing:
+                    local_store.update_consolidado(existing["id"], **data)
+                else:
+                    local_store.add_consolidado(data)
+            except Exception as e:
+                messagebox.showerror(
+                    "Error", f"No se pudo guardar:\n{e}", parent=win
+                )
+                return
+
+            win.destroy()
+            self._refresh_consolidados()
+            self._flash_status("Consolidado guardado ✓")
+
+        ttk.Button(btns, text="Guardar", command=do_save).pack(side="right")
+        ttk.Button(btns, text="Cancelar", command=win.destroy).pack(
+            side="right", padx=(0, 6)
+        )
+
+        win.bind("<Return>", lambda _e: do_save())
+        win.bind("<KP_Enter>", lambda _e: do_save())
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
 
     def _on_select(self, _event=None):
         sel = self.tree.selection()

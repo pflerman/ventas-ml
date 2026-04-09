@@ -12,7 +12,8 @@ Estructura del JSON:
     "etiquetas_catalogo": ["ordenador", "blanco", ...],  # valores permitidos
     "etiquetas_por_sku":  {"SKU": ["ordenador", ...]},   # asignaciones
     "neto_manual":        {"order_id": 12345.67},        # neto MP cargado a mano
-    "shipping_manual":    {"order_id": 6500.00}          # costo Flex que paga el seller
+    "shipping_manual":    {"order_id": 6500.00},         # costo Flex que paga el seller
+    "consolidados":       [{"id": "...", "fecha_creacion": "2026-04-09", ...}]
 }
 
 Patrón de uso:
@@ -35,6 +36,7 @@ _data: dict = {
     "etiquetas_por_sku": {},
     "neto_manual": {},
     "shipping_manual": {},
+    "consolidados": [],
 }
 _checks_set: set[str] = set()
 _loaded = False
@@ -376,3 +378,82 @@ def get_neto_efectivo(order_id: str) -> float | None:
         return None
     shipping = get_shipping_manual(order_id) or 0.0
     return neto - shipping
+
+
+# ────────────────────── Consolidados (sección Consolidados) ──────────────────────
+# Lista de tarjetas independientes (no se vinculan con las ventas). Cada
+# tarjeta representa una consolidación de pago entre Pablo y Andrés:
+#   - fecha_creacion: cuándo se cargó (manual)
+#   - fecha_desde / fecha_hasta: rango de la mercadería que se está consolidando
+#   - fecha_pago: cuándo se paga (resaltado en la UI)
+#   - monto_deuda: lo que Pablo le debe a Andrés
+#   - credito: lo que Andrés le debe a Pablo (sueldo, devoluciones, etc.) → se resta
+#   - activo: si está vigente o ya cerrada
+#   - facturado: si Andrés ya facturó esa cantidad
+#   - nota: texto libre
+# Todo manual, no se infiere de ninguna otra parte de la app.
+
+import uuid as _uuid
+
+
+def list_consolidados() -> list[dict]:
+    """Devuelve una copia de la lista entera (en orden de inserción)."""
+    return [dict(c) for c in _data.get("consolidados", [])]
+
+
+def add_consolidado(data: dict) -> str:
+    """Agrega una tarjeta nueva. Devuelve el id generado."""
+    cid = _uuid.uuid4().hex[:10]
+    entry = {
+        "id": cid,
+        "fecha_creacion": data.get("fecha_creacion") or "",
+        "fecha_desde": data.get("fecha_desde") or "",
+        "fecha_hasta": data.get("fecha_hasta") or "",
+        "fecha_pago": data.get("fecha_pago") or "",
+        "monto_deuda": float(data.get("monto_deuda") or 0),
+        "credito": float(data.get("credito") or 0),
+        "activo": bool(data.get("activo", True)),
+        "facturado": bool(data.get("facturado", False)),
+        "nota": data.get("nota") or "",
+    }
+    _data.setdefault("consolidados", []).append(entry)
+    _save()
+    return cid
+
+
+def update_consolidado(cid: str, **fields) -> None:
+    """Actualiza campos de una tarjeta existente."""
+    if not cid:
+        return
+    for c in _data.get("consolidados", []):
+        if c.get("id") == cid:
+            for k, v in fields.items():
+                if k == "id":
+                    continue
+                if k in ("monto_deuda", "credito"):
+                    c[k] = float(v or 0)
+                elif k in ("activo", "facturado"):
+                    c[k] = bool(v)
+                else:
+                    c[k] = v if v is not None else ""
+            _save()
+            return
+
+
+def delete_consolidado(cid: str) -> None:
+    if not cid:
+        return
+    cs = _data.get("consolidados", [])
+    new = [c for c in cs if c.get("id") != cid]
+    if len(new) != len(cs):
+        _data["consolidados"] = new
+        _save()
+
+
+def get_consolidado(cid: str) -> dict | None:
+    if not cid:
+        return None
+    for c in _data.get("consolidados", []):
+        if c.get("id") == cid:
+            return dict(c)
+    return None
