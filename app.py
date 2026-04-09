@@ -2701,13 +2701,21 @@ class VentasApp:
         self._flash_status("Título copiado ✓")
 
     def _open_url(self, url: str):
-        """Abre una URL. En WSL usa cmd.exe /c start (browser default de
-        Windows, típicamente Chrome); en Linux nativo usa webbrowser.open
-        (que respeta xdg-open / BROWSER, típicamente Brave/Firefox)."""
+        """Abre una URL en el browser y trata de levantarlo al frente.
+
+        - WSL: cmd.exe /c start (Windows ya levanta la ventana solo).
+        - Linux Wayland: la política anti-focus-stealing del WM hace que
+          xdg-open / Popen del binario solo "rebote" el ícono del dock.
+          La forma canónica de activar una app respetando el activation
+          token es `gtk-launch <desktop-id> <url>`, que pasa por GIO y
+          usa el portal correctamente. Probamos varios .desktop comunes
+          en orden de preferencia, con fallback a Popen del binario y por
+          último a webbrowser.open."""
+        import subprocess
+        import shutil
+
         if _IS_WSL:
             try:
-                import subprocess
-                # cmd.exe /c start "" <url> — comillas vacías son el title
                 subprocess.run(
                     ["cmd.exe", "/c", "start", "", url],
                     check=True,
@@ -2716,7 +2724,50 @@ class VentasApp:
                 )
                 return
             except (OSError, subprocess.CalledProcessError):
-                pass  # fallback a webbrowser
+                pass
+            webbrowser.open(url)
+            return
+
+        # Linux: gtk-launch con .desktop. Más confiable en Wayland que Popen
+        # directo porque pasa por el flow de activation token de GIO.
+        if shutil.which("gtk-launch"):
+            for desktop_id in (
+                "brave-browser",
+                "com.brave.Browser",
+                "google-chrome",
+                "com.google.Chrome",
+                "org.mozilla.firefox",
+                "firefox",
+            ):
+                try:
+                    r = subprocess.run(
+                        ["gtk-launch", desktop_id, url],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        timeout=3,
+                    )
+                    if r.returncode == 0:
+                        return
+                except (OSError, subprocess.SubprocessError):
+                    continue
+
+        # Fallback 1: Popen del binario directamente.
+        for browser in ("brave-browser", "google-chrome", "chromium", "firefox"):
+            path = shutil.which(browser)
+            if not path:
+                continue
+            try:
+                subprocess.Popen(
+                    [path, url],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+                return
+            except OSError:
+                continue
+
+        # Fallback 2: webbrowser stdlib (xdg-open).
         webbrowser.open(url)
 
     def _set_clipboard(self, text: str):
