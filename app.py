@@ -16,8 +16,10 @@ from tkinter import messagebox, ttk
 from PIL import Image, ImageTk
 
 import dolar
+import frase
 import productos_lookup
 import ventas_db
+import whatsapp_send
 
 # WSL no sincroniza el clipboard de Tk (X11/WSLg) con el de Windows.
 # Si estamos en WSL usamos clip.exe directo para que Ctrl+V funcione en apps Windows.
@@ -483,6 +485,15 @@ class VentasApp:
         self.detail_ganancia_frame = ttk.Frame(self.detail_frame)
         self.detail_ganancia_frame.pack(fill="x", anchor="w")
 
+        ttk.Separator(self.detail_frame, orient="horizontal").pack(
+            fill="x", pady=(16, 8)
+        )
+        ttk.Button(
+            self.detail_frame,
+            text="✨ Frase del día ✨",
+            command=self._open_frase_modal,
+        ).pack(anchor="w")
+
     def _on_select(self, _event=None):
         sel = self.tree.selection()
         if not sel:
@@ -589,13 +600,27 @@ class VentasApp:
             row.pack(fill="x", anchor="w", pady=1)
             is_total = label in ("Bruto", "Neto")
             font = ("TkDefaultFont", 10, "bold") if is_total else ("TkDefaultFont", 10)
-            ttk.Label(row, text=label, font=font).pack(side="left")
-            tk.Label(
-                row,
-                text=format_price(value),
-                foreground=color,
-                font=font,
-            ).pack(side="right")
+            if label == "Neto":
+                tk.Label(
+                    row,
+                    text="Ganancia Mercado Pago →",
+                    foreground="#1f4e9d",
+                    font=("TkDefaultFont", 12, "bold"),
+                ).pack(side="left")
+                tk.Label(
+                    row,
+                    text=format_price(value),
+                    foreground="#1f4e9d",
+                    font=("TkDefaultFont", 12, "bold", "underline"),
+                ).pack(side="right")
+            else:
+                ttk.Label(row, text=label, font=font).pack(side="left")
+                tk.Label(
+                    row,
+                    text=format_price(value),
+                    foreground=color,
+                    font=font,
+                ).pack(side="right")
 
         method = info.get("payment_method") or ""
         if method:
@@ -658,14 +683,17 @@ class VentasApp:
         # Línea final destacada.
         row = ttk.Frame(frame)
         row.pack(fill="x", anchor="w", pady=(6, 0))
-        ttk.Label(
-            row, text="Ganancia", font=("TkDefaultFont", 12, "bold")
+        tk.Label(
+            row,
+            text="Ganancia Total Pablo →",
+            foreground="#1e7a1e",
+            font=("TkDefaultFont", 12, "bold"),
         ).pack(side="left")
         tk.Label(
             row,
             text=format_price(ganancia),
-            foreground=color,
-            font=("TkDefaultFont", 12, "bold"),
+            foreground="#1e7a1e",
+            font=("TkDefaultFont", 12, "bold", "underline"),
         ).pack(side="right")
 
     def _render_costo(self, producto: dict | None, sku: str | None):
@@ -760,9 +788,24 @@ class VentasApp:
         for label, value, color, is_total in rows:
             row = ttk.Frame(frame)
             row.pack(fill="x", anchor="w", pady=1)
-            font = ("TkDefaultFont", 10, "bold") if is_total else ("TkDefaultFont", 10)
-            ttk.Label(row, text=label, font=font).pack(side="left")
-            tk.Label(row, text=value, foreground=color, font=font).pack(side="right")
+            if is_total:
+                tk.Label(
+                    row,
+                    text="pagar a Andrés →",
+                    foreground="#c0392b",
+                    font=("TkDefaultFont", 12, "bold"),
+                ).pack(side="left")
+                tk.Label(
+                    row,
+                    text=value,
+                    foreground="#c0392b",
+                    font=("TkDefaultFont", 12, "bold", "underline"),
+                ).pack(side="right")
+            else:
+                ttk.Label(row, text=label, font=("TkDefaultFont", 10)).pack(side="left")
+                tk.Label(
+                    row, text=value, foreground=color, font=("TkDefaultFont", 10)
+                ).pack(side="right")
 
     def _on_alt_click(self, event):
         row = self.tree.identify_row(event.y)
@@ -1067,29 +1110,58 @@ class VentasApp:
         if totales["count_calc"] > 0:
             ttk.Separator(numbers, orient="horizontal").pack(fill="x", pady=6)
 
-            cobertura_note = ""
-            if totales["count_calc"] < totales["count_total"]:
-                cobertura_note = (
-                    f"  (calculado sobre {totales['count_calc']} "
-                    f"de {totales['count_total']})"
-                )
+            # Centramos las dos filas con grid: columnas 0 y 2 absorben
+            # el espacio sobrante, la fila va en la columna 1 (centrada).
+            center_box = ttk.Frame(numbers)
+            center_box.pack(fill="x", pady=(2, 0))
+            center_box.grid_columnconfigure(0, weight=1)
+            center_box.grid_columnconfigure(2, weight=1)
 
-            add_row(
-                numbers,
-                f"Costo total{cobertura_note}",
+            costo_text = f"Total para pagar a Andrés - {format_price(totales['costo'])}"
+            ganancia_text = (
+                f"Ganancia de Pablo total {format_price(totales['ganancia'])}"
+            )
+
+            def make_clickable_row(parent, grid_row, label_text, value_text, color, copy_text):
+                row_frame = ttk.Frame(parent)
+                row_frame.grid(row=grid_row, column=1, pady=2)
+                lbl_left = tk.Label(
+                    row_frame,
+                    text=label_text,
+                    foreground=color,
+                    font=("TkDefaultFont", 12, "bold"),
+                    cursor="hand2",
+                )
+                lbl_left.pack(side="left", padx=(0, 6))
+                lbl_right = tk.Label(
+                    row_frame,
+                    text=value_text,
+                    foreground=color,
+                    font=("TkDefaultFont", 12, "bold"),
+                    cursor="hand2",
+                )
+                lbl_right.pack(side="left")
+
+                def on_click(_e=None):
+                    self._set_clipboard(copy_text)
+                    self._flash_status(f"Copiado: {copy_text}")
+
+                for w in (row_frame, lbl_left, lbl_right):
+                    w.bind("<Button-1>", on_click)
+
+            make_clickable_row(
+                center_box, 0,
+                "Total para pagar a Andrés →",
                 f"- {format_price(totales['costo'])}",
                 "#c0392b",
+                costo_text,
             )
-            ganancia_color = (
-                "#1e7a1e" if totales["ganancia"] >= 0 else "#c0392b"
-            )
-            add_row(
-                numbers,
-                "Ganancia",
+            make_clickable_row(
+                center_box, 1,
+                "Ganancia de Pablo total →",
                 format_price(totales["ganancia"]),
-                ganancia_color,
-                bold=True,
-                big=True,
+                "#1e7a1e",
+                ganancia_text,
             )
 
         # Listado de problemas
@@ -1156,6 +1228,190 @@ class VentasApp:
             dolar.cargar()
             self.root.after(0, self._on_dolar_cargado)
         threading.Thread(target=worker, daemon=True).start()
+
+    # ────────────── Frase del día (modal) ──────────────
+    # Tk en Linux no rendea emojis en color con la fuente default. Symbola
+    # tiene Latin + emojis (mono) en una sola fuente, así que renderizamos
+    # la frase con PIL y la mostramos como PhotoImage. Sin esto los emojis
+    # aparecen como cuadraditos vacíos. Ver skill `iconos-pil-tkinter`.
+    _SYMBOLA_PATH = "/usr/share/fonts/gdouros-symbola/Symbola.ttf"
+    _MONO_PATH = "/usr/share/fonts/liberation-mono-fonts/LiberationMono-Bold.ttf"
+
+    def _open_frase_modal(self):
+        win = tk.Toplevel(self.root)
+        win.title("Frase del día")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        outer = ttk.Frame(win, padding=20)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(
+            outer,
+            text="✨ Frase del día de Claude ✨",
+            font=("TkDefaultFont", 14, "bold"),
+            foreground="#7d3c98",
+        ).pack(anchor="w", pady=(0, 12))
+
+        body = ttk.Frame(outer)
+        body.pack(fill="both", expand=True, pady=(0, 12))
+
+        # Label que vamos a actualizar (texto loading → imagen frase).
+        frase_lbl = ttk.Label(
+            body,
+            text="Cargando frase…",
+            foreground="#888",
+            font=("TkDefaultFont", 11, "italic"),
+        )
+        frase_lbl.pack(anchor="w")
+
+        btn_bar = ttk.Frame(outer)
+        btn_bar.pack(fill="x")
+
+        send_btn = ttk.Button(btn_bar, text="📨 Mandar a Pablo")
+        send_btn.pack(side="left")
+        send_btn.configure(state="disabled")
+
+        refresh_btn = ttk.Button(btn_bar, text="🔄 Otra")
+        refresh_btn.pack(side="left", padx=(8, 0))
+        refresh_btn.configure(state="disabled")
+
+        ttk.Button(btn_bar, text="Cerrar", command=win.destroy).pack(side="right")
+
+        status_lbl = ttk.Label(
+            outer, text="", foreground="#888",
+            font=("TkDefaultFont", 9, "italic"),
+        )
+        status_lbl.pack(anchor="w", pady=(8, 0))
+
+        # Mantenemos refs a la imagen para que el GC no se la coma.
+        state = {"img": None, "texto": None}
+
+        def cargar():
+            send_btn.configure(state="disabled")
+            refresh_btn.configure(state="disabled")
+            frase_lbl.configure(image="", text="Cargando frase…")
+            status_lbl.configure(text="")
+
+            def worker():
+                texto = frase.cargar()
+                self.root.after(0, lambda: on_loaded(texto))
+            threading.Thread(target=worker, daemon=True).start()
+
+        def on_loaded(texto):
+            if not texto:
+                frase_lbl.configure(image="", text="(no se pudo cargar)")
+                refresh_btn.configure(state="normal")
+                return
+            state["texto"] = texto
+            try:
+                photo = self._render_frase_image(texto, max_width=520)
+            except Exception as e:
+                frase_lbl.configure(image="", text=f"(error rindiendo: {e})")
+                refresh_btn.configure(state="normal")
+                return
+            state["img"] = photo
+            frase_lbl.configure(image=photo, text="")
+            send_btn.configure(state="normal")
+            refresh_btn.configure(state="normal")
+
+        def enviar():
+            texto = state["texto"]
+            if not texto:
+                return
+            send_btn.configure(state="disabled")
+            status_lbl.configure(text="Enviando…", foreground="#888")
+
+            def worker():
+                ok, detalle = whatsapp_send.enviar(texto)
+                self.root.after(0, lambda: on_sent(ok, detalle))
+            threading.Thread(target=worker, daemon=True).start()
+
+        def on_sent(ok, detalle):
+            if ok:
+                status_lbl.configure(text="✓ Enviado a Pablo", foreground="#1e7a1e")
+            else:
+                status_lbl.configure(
+                    text=f"✕ {detalle[:80]}", foreground="#c0392b"
+                )
+            send_btn.configure(state="normal")
+
+        send_btn.configure(command=enviar)
+        refresh_btn.configure(command=cargar)
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        # Centrar respecto a la ventana principal.
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")
+
+        cargar()
+
+    def _render_frase_image(self, texto: str, max_width: int = 520):
+        """Rinde la frase con look CRT verde fósforo: mono bold para texto,
+        Symbola para emojis (que mono no tiene), fondo negro."""
+        from PIL import Image, ImageDraw, ImageFont, ImageTk
+
+        font_size = 20
+        color = (51, 255, 51)   # verde fósforo CRT (#33ff33)
+        bg = (0, 0, 0)          # negro
+        padding = 18
+
+        mono = ImageFont.truetype(self._MONO_PATH, font_size)
+        emoji = ImageFont.truetype(self._SYMBOLA_PATH, font_size)
+
+        def font_for(ch: str):
+            # Heurística: ASCII + Latin-1 + signos básicos van en mono.
+            # Todo lo "raro" (emojis, símbolos, dingbats) cae a Symbola.
+            cp = ord(ch)
+            if cp < 0x2000:
+                return mono
+            return emoji
+
+        def measure(s: str) -> int:
+            # Medimos sumando el ancho de cada char con su fuente.
+            w = 0
+            for ch in s:
+                bbox = font_for(ch).getbbox(ch)
+                w += bbox[2] - bbox[0] if bbox else 0
+            return w
+
+        # Wrap manual por palabras.
+        max_text_width = max_width - 2 * padding
+        words = texto.split()
+        lines: list[str] = []
+        current = ""
+        for w in words:
+            candidate = (current + " " + w).strip()
+            if measure(candidate) <= max_text_width or not current:
+                current = candidate
+            else:
+                lines.append(current)
+                current = w
+        if current:
+            lines.append(current)
+
+        ascent, descent = mono.getmetrics()
+        line_h = ascent + descent + 6
+        height = padding * 2 + line_h * len(lines)
+        width = max_width
+
+        img = Image.new("RGB", (width, height), bg)
+        draw = ImageDraw.Draw(img)
+        y = padding
+        for line in lines:
+            x = padding
+            for ch in line:
+                f = font_for(ch)
+                draw.text((x, y), ch, font=f, fill=color)
+                bbox = f.getbbox(ch)
+                x += (bbox[2] - bbox[0]) if bbox else 0
+            y += line_h
+
+        return ImageTk.PhotoImage(img)
+    # ──────────────────────────────────────────────────
+
 
     def _on_dolar_cargado(self):
         cot = dolar.get()
