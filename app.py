@@ -6,6 +6,7 @@ import os
 import sys
 import threading
 import tkinter as tk
+import unicodedata
 import webbrowser
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,9 @@ from tkinter import messagebox, ttk
 
 from PIL import Image, ImageTk
 
+import dolar
 import productos_lookup
+import ventas_db
 
 # WSL no sincroniza el clipboard de Tk (X11/WSLg) con el de Windows.
 # Si estamos en WSL usamos clip.exe directo para que Ctrl+V funcione en apps Windows.
@@ -32,28 +35,9 @@ from urllib.request import Request, urlopen
 USER_ID = 24192412
 PAGE_SIZE = 50
 API_URL = "https://api.mercadolibre.com/orders/search"
-SELECTIONS_PATH = Path(__file__).resolve().parent / "seleccionadas.json"
 
 CHECKED = "☑"
 UNCHECKED = "☐"
-
-
-def load_selections() -> set:
-    if not SELECTIONS_PATH.exists():
-        SELECTIONS_PATH.write_text("[]", encoding="utf-8")
-        return set()
-    try:
-        data = json.loads(SELECTIONS_PATH.read_text(encoding="utf-8"))
-        return {str(x) for x in data}
-    except (json.JSONDecodeError, OSError):
-        return set()
-
-
-def save_selections(ids: set) -> None:
-    SELECTIONS_PATH.write_text(
-        json.dumps(sorted(ids), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
 
 # Reutilizamos MLAuth del proyecto mercadolibre-mcp para manejar refresh.
 ML_MCP_DIR = Path.home() / "Proyectos" / "mercadolibre-mcp"
@@ -126,11 +110,24 @@ def format_price(value) -> str:
     return f"${n:,.2f}"
 
 
+def _normalize(text: str) -> str:
+    """Minúsculas + sin acentos/tildes (mismo helper que gestor-productos)."""
+    text = (text or "").lower()
+    nfkd = unicodedata.normalize("NFD", text)
+    return "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
+
+
+# Costeo de importación desde China.
+# precio_fob (USD) -> nacionalizado (USD) -> en pesos -> + ganancia hermano
+NACIONALIZACION_MULT = 1.9
+GANANCIA_HERMANO_MULT = 1.30
+
+
 class VentasApp:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("Ventas PaliShopping")
-        self.root.geometry("900x600")
+        self.root.geometry("900x780")
 
         try:
             self.auth = get_auth()
@@ -141,16 +138,23 @@ class VentasApp:
         self.offset = 0
         self.total = 0
         self.loading = False
-        self.selected_ids: set = load_selections()
         self.row_to_order: dict = {}  # tree item id -> order_id (solo hojas)
         self.row_base: dict = {}  # tree item id -> "odd"/"even"
         self.leaf_to_item: dict = {}  # tree leaf id -> {item_id, variation_id, sku, title}
         self.day_nodes: dict = {}  # "DD/MM/YYYY" -> parent row id
         self.day_count: dict = {}  # "DD/MM/YYYY" -> int
         self.day_total: dict = {}  # "DD/MM/YYYY" -> float
+        self._last_costo_unitario: float | None = None  # seteado por _render_costo
+        # Para el filtro: por cada leaf cargado guardamos el día y el texto
+        # normalizado para matchear sin tener que re-leer values del Treeview.
+        self._leaves_meta: dict = {}  # leaf_id -> {"day_key", "row_text", "order"}
+        self._leaf_order_counter = 0  # contador para preservar orden de inserción
+        self._filter_active = False
 
         self._build_ui()
         self._cargar_productos_async()
+        self._cargar_dolar_async()
+        self._cargar_ventas_db_async()
         self.refresh()
 
     def _build_ui(self):
@@ -183,8 +187,99 @@ class VentasApp:
         tree_frame = ttk.Frame(paned)
         paned.add(tree_frame, weight=3)
 
-        self.detail_frame = ttk.Frame(paned, padding=(10, 4))
-        paned.add(self.detail_frame, weight=1)
+        # ─── Filter bar (mismo estilo funcional que gestor-productos) ───
+        filter_bar = ttk.Frame(tree_frame)
+        filter_bar.pack(side="top", fill="x", pady=(0, 6))
+
+        ttk.Label(filter_bar, text="🔍 Buscar:").pack(side="left", padx=(0, 4))
+        self._buscar_var = tk.StringVar()
+        self._buscar_var.trace_add("write", lambda *_: self._refresh_tree_filter())
+        self._buscar_entry = ttk.Entry(
+            filter_bar, textvariable=self._buscar_var, width=24
+        )
+        self._buscar_entry.pack(side="left", padx=(0, 12))
+
+        ttk.Label(filter_bar, text="✕ Excluir:").pack(side="left", padx=(0, 4))
+        self._excluir_var = tk.StringVar()
+        self._excluir_var.trace_add("write", lambda *_: self._refresh_tree_filter())
+        self._excluir_entry = ttk.Entry(
+            filter_bar, textvariable=self._excluir_var, width=24
+        )
+        self._excluir_entry.pack(side="left", padx=(0, 8))
+
+        self._BUSCAR_PLACEHOLDER = "SKU o producto..."
+        self._EXCLUIR_PLACEHOLDER = "palabras a excluir..."
+        self._setup_filter_placeholder(
+            self._buscar_entry, self._buscar_var, self._BUSCAR_PLACEHOLDER
+        )
+        self._setup_filter_placeholder(
+            self._excluir_entry, self._excluir_var, self._EXCLUIR_PLACEHOLDER
+        )
+
+        ttk.Button(
+            filter_bar, text="Limpiar", command=self._limpiar_filtros
+        ).pack(side="left")
+
+        # Panel lateral scrollable: PanedWindow ⊃ outer ⊃ Canvas + Scrollbar,
+        # con `detail_frame` viviendo adentro del Canvas via create_window.
+        # El resto del código sigue manipulando self.detail_frame sin enterarse.
+        detail_outer = ttk.Frame(paned)
+        paned.add(detail_outer, weight=1)
+
+        self.detail_canvas = tk.Canvas(
+            detail_outer, highlightthickness=0, borderwidth=0
+        )
+        detail_vsb = ttk.Scrollbar(
+            detail_outer, orient="vertical", command=self.detail_canvas.yview
+        )
+        self.detail_canvas.configure(yscrollcommand=detail_vsb.set)
+        detail_vsb.pack(side="right", fill="y")
+        self.detail_canvas.pack(side="left", fill="both", expand=True)
+
+        self.detail_frame = ttk.Frame(self.detail_canvas, padding=(10, 4))
+        self._detail_window_id = self.detail_canvas.create_window(
+            (0, 0), window=self.detail_frame, anchor="nw"
+        )
+
+        # Cuando cambia el contenido del panel, actualizar el área scrollable.
+        self.detail_frame.bind(
+            "<Configure>",
+            lambda e: self.detail_canvas.configure(
+                scrollregion=self.detail_canvas.bbox("all")
+            ),
+        )
+        # Cuando se redimensiona el Canvas (drag del PanedWindow / resize ventana),
+        # forzar al frame interno a tener el mismo ancho — si no, los wraplength
+        # se calculan sobre un ancho equivocado.
+        self.detail_canvas.bind(
+            "<Configure>",
+            lambda e: self.detail_canvas.itemconfig(
+                self._detail_window_id, width=e.width
+            ),
+        )
+
+        # Mouse wheel sobre el panel: en Linux son Button-4/Button-5,
+        # en Windows/macOS es <MouseWheel>. Solo activo el binding cuando
+        # el cursor está sobre el panel para no robarle el wheel al Treeview.
+        def _on_mousewheel(event):
+            if event.num == 4 or getattr(event, "delta", 0) > 0:
+                self.detail_canvas.yview_scroll(-3, "units")
+            else:
+                self.detail_canvas.yview_scroll(3, "units")
+
+        def _bind_wheel(_e):
+            self.detail_canvas.bind_all("<MouseWheel>", _on_mousewheel)
+            self.detail_canvas.bind_all("<Button-4>", _on_mousewheel)
+            self.detail_canvas.bind_all("<Button-5>", _on_mousewheel)
+
+        def _unbind_wheel(_e):
+            self.detail_canvas.unbind_all("<MouseWheel>")
+            self.detail_canvas.unbind_all("<Button-4>")
+            self.detail_canvas.unbind_all("<Button-5>")
+
+        self.detail_canvas.bind("<Enter>", _bind_wheel)
+        self.detail_canvas.bind("<Leave>", _unbind_wheel)
+
         self._build_detail_panel()
 
         columns = ("check", "fecha", "sku", "cant", "producto", "precio", "subtotal")
@@ -217,17 +312,23 @@ class VentasApp:
         self.tree.bind("<Shift-Button-1>", self._on_shift_click)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Alt-Button-1>", self._on_alt_click)
+        self.tree.bind("<Control-Shift-Button-1>", self._on_ctrl_shift_click)
+        self.tree.bind("<Control-Shift-Alt-Button-1>", self._on_ctrl_shift_alt_click)
 
-        self._hint_active = None  # "ctrl" / "shift" / None
+        self._modifiers_active: set[str] = set()  # subset of {"ctrl", "shift", "alt"}
         self._status_before_hint = ""
-        self.root.bind("<KeyPress-Control_L>", lambda e: self._show_hint("ctrl"))
-        self.root.bind("<KeyPress-Control_R>", lambda e: self._show_hint("ctrl"))
-        self.root.bind("<KeyRelease-Control_L>", lambda e: self._hide_hint("ctrl"))
-        self.root.bind("<KeyRelease-Control_R>", lambda e: self._hide_hint("ctrl"))
-        self.root.bind("<KeyPress-Shift_L>", lambda e: self._show_hint("shift"))
-        self.root.bind("<KeyPress-Shift_R>", lambda e: self._show_hint("shift"))
-        self.root.bind("<KeyRelease-Shift_L>", lambda e: self._hide_hint("shift"))
-        self.root.bind("<KeyRelease-Shift_R>", lambda e: self._hide_hint("shift"))
+        self.root.bind("<KeyPress-Control_L>", lambda e: self._modifier_pressed("ctrl"))
+        self.root.bind("<KeyPress-Control_R>", lambda e: self._modifier_pressed("ctrl"))
+        self.root.bind("<KeyRelease-Control_L>", lambda e: self._modifier_released("ctrl"))
+        self.root.bind("<KeyRelease-Control_R>", lambda e: self._modifier_released("ctrl"))
+        self.root.bind("<KeyPress-Shift_L>", lambda e: self._modifier_pressed("shift"))
+        self.root.bind("<KeyPress-Shift_R>", lambda e: self._modifier_pressed("shift"))
+        self.root.bind("<KeyRelease-Shift_L>", lambda e: self._modifier_released("shift"))
+        self.root.bind("<KeyRelease-Shift_R>", lambda e: self._modifier_released("shift"))
+        self.root.bind("<KeyPress-Alt_L>", lambda e: self._modifier_pressed("alt"))
+        self.root.bind("<KeyPress-Alt_R>", lambda e: self._modifier_pressed("alt"))
+        self.root.bind("<KeyRelease-Alt_L>", lambda e: self._modifier_released("alt"))
+        self.root.bind("<KeyRelease-Alt_R>", lambda e: self._modifier_released("alt"))
 
         self.context_menu = tk.Menu(self.tree, tearoff=0)
         self.context_menu.add_command(
@@ -269,6 +370,33 @@ class VentasApp:
         self.status_var = tk.StringVar(value="")
         ttk.Label(bottom, textvariable=self.status_var).pack(side="left")
 
+        self.dolar_var = tk.StringVar(value="USD …")
+        ttk.Label(
+            bottom,
+            textvariable=self.dolar_var,
+            foreground="#1e7a1e",
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(side="left", padx=(16, 0))
+
+        # Mini totalizador de ventas seleccionadas. Aparece solo cuando hay 1+.
+        self.totales_costo_var = tk.StringVar(value="")
+        self.totales_costo_lbl = tk.Label(
+            bottom,
+            textvariable=self.totales_costo_var,
+            foreground="#c0392b",
+            font=("TkDefaultFont", 10),
+        )
+        self.totales_costo_lbl.pack(side="left", padx=(16, 0))
+
+        self.totales_ganancia_var = tk.StringVar(value="")
+        self.totales_ganancia_lbl = tk.Label(
+            bottom,
+            textvariable=self.totales_ganancia_var,
+            foreground="#1e7a1e",
+            font=("TkDefaultFont", 10, "bold"),
+        )
+        self.totales_ganancia_lbl.pack(side="left", padx=(8, 0))
+
         self.btn_more = ttk.Button(bottom, text="Cargar más", command=self.load_more)
         self.btn_more.pack(side="right", padx=(6, 0))
         self.btn_refresh = ttk.Button(bottom, text="Actualizar", command=self.refresh)
@@ -277,6 +405,10 @@ class VentasApp:
             bottom, text="Exportar Excel", command=self.export_excel
         )
         self.btn_export.pack(side="right", padx=(0, 6))
+        self.btn_totales = ttk.Button(
+            bottom, text="Detalle totales", command=self._open_totales_modal
+        )
+        self.btn_totales.pack(side="right", padx=(0, 6))
 
     def _build_detail_panel(self):
         ttk.Label(
@@ -310,6 +442,19 @@ class VentasApp:
 
         ttk.Label(
             self.detail_frame,
+            text="Costo importación",
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+
+        self.detail_costo_frame = ttk.Frame(self.detail_frame)
+        self.detail_costo_frame.pack(fill="x", anchor="w")
+
+        ttk.Separator(self.detail_frame, orient="horizontal").pack(
+            fill="x", pady=(12, 8)
+        )
+
+        ttk.Label(
+            self.detail_frame,
             text="Cobro Mercado Pago",
             font=("TkDefaultFont", 10, "bold"),
         ).pack(anchor="w", pady=(0, 4))
@@ -324,6 +469,19 @@ class VentasApp:
             font=("TkDefaultFont", 9, "italic"),
         )
         self.detail_payment_hint.pack(anchor="w", pady=(8, 0))
+
+        ttk.Separator(self.detail_frame, orient="horizontal").pack(
+            fill="x", pady=(12, 8)
+        )
+
+        ttk.Label(
+            self.detail_frame,
+            text="Ganancia total",
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+
+        self.detail_ganancia_frame = ttk.Frame(self.detail_frame)
+        self.detail_ganancia_frame.pack(fill="x", anchor="w")
 
     def _on_select(self, _event=None):
         sel = self.tree.selection()
@@ -345,8 +503,18 @@ class VentasApp:
             w.destroy()
         for w in self.detail_payment_frame.winfo_children():
             w.destroy()
+        for w in self.detail_costo_frame.winfo_children():
+            w.destroy()
+        for w in self.detail_ganancia_frame.winfo_children():
+            w.destroy()
 
+        # Reset del costo unitario calculado (lo setea _render_costo si puede).
+        # _render_costo va antes que _render_ganancia porque la ganancia
+        # depende del costo total calculado acá.
+        self._last_costo_unitario = None
+        self._render_costo(producto, sku)
         self._render_payment(info)
+        self._render_ganancia(info)
 
         if sku is None:
             self.detail_status_var.set("Seleccioná una venta")
@@ -445,6 +613,157 @@ class VentasApp:
             font=("TkDefaultFont", 9),
         ).pack(anchor="w")
 
+    def _render_ganancia(self, info: dict | None):
+        frame = self.detail_ganancia_frame
+        costo_unitario = self._last_costo_unitario
+        neto = (info or {}).get("neto") if info else None
+
+        if costo_unitario is None or neto is None:
+            ttk.Label(
+                frame,
+                text="(faltan datos para calcular)",
+                foreground="#888",
+            ).pack(anchor="w")
+            return
+
+        try:
+            quantity = int((info or {}).get("quantity") or 1)
+        except (TypeError, ValueError):
+            quantity = 1
+
+        costo_total = costo_unitario * quantity
+        ganancia = float(neto) - costo_total
+        color = "#1e7a1e" if ganancia >= 0 else "#c0392b"
+
+        # Desglose chico arriba para que se entienda de dónde sale.
+        rows_detail = [
+            ("Neto MP", format_price(neto), "#1e7a1e"),
+            (
+                f"Costo (×{quantity})" if quantity != 1 else "Costo",
+                f"- {format_price(costo_total)}",
+                "#c0392b",
+            ),
+        ]
+        for label, value, value_color in rows_detail:
+            row = ttk.Frame(frame)
+            row.pack(fill="x", anchor="w", pady=1)
+            ttk.Label(row, text=label, font=("TkDefaultFont", 10)).pack(side="left")
+            tk.Label(
+                row,
+                text=value,
+                foreground=value_color,
+                font=("TkDefaultFont", 10),
+            ).pack(side="right")
+
+        # Línea final destacada.
+        row = ttk.Frame(frame)
+        row.pack(fill="x", anchor="w", pady=(6, 0))
+        ttk.Label(
+            row, text="Ganancia", font=("TkDefaultFont", 12, "bold")
+        ).pack(side="left")
+        tk.Label(
+            row,
+            text=format_price(ganancia),
+            foreground=color,
+            font=("TkDefaultFont", 12, "bold"),
+        ).pack(side="right")
+
+    def _render_costo(self, producto: dict | None, sku: str | None):
+        frame = self.detail_costo_frame
+        if not sku:
+            ttk.Label(
+                frame, text="(sin SKU)", foreground="#888"
+            ).pack(anchor="w")
+            return
+        if not ventas_db.loaded():
+            ttk.Label(
+                frame, text="Cargando…", foreground="#888"
+            ).pack(anchor="w")
+            return
+        fob = ventas_db.get_fob(sku)
+        if not fob or fob <= 0:
+            ttk.Label(
+                frame,
+                text="Sin precio FOB cargado",
+                foreground="#888",
+            ).pack(anchor="w")
+            ttk.Label(
+                frame,
+                text="Ctrl+Shift+Click en la fila para cargarlo",
+                foreground="#888",
+                font=("TkDefaultFont", 9, "italic"),
+            ).pack(anchor="w")
+            return
+
+        mult = ventas_db.get_multiplicador(sku)
+        if mult is None:
+            # FOB cargado pero falta el multiplicador → no se puede calcular nada.
+            row = ttk.Frame(frame)
+            row.pack(fill="x", anchor="w", pady=1)
+            ttk.Label(row, text="FOB unitario", font=("TkDefaultFont", 10)).pack(side="left")
+            tk.Label(
+                row,
+                text=f"USD {fob:,.2f}",
+                foreground="#d35400",
+                font=("TkDefaultFont", 10, "bold"),
+            ).pack(side="right")
+            ttk.Label(
+                frame,
+                text="⚠️ Falta multiplicador",
+                foreground="#d35400",
+                font=("TkDefaultFont", 10, "bold"),
+            ).pack(anchor="w", pady=(6, 0))
+            ttk.Label(
+                frame,
+                text="Ctrl+Shift+Alt+Click en la fila para cargarlo",
+                foreground="#888",
+                font=("TkDefaultFont", 9, "italic"),
+            ).pack(anchor="w")
+            return
+
+        fob_total = fob * mult
+        nacionalizado_usd = fob_total * NACIONALIZACION_MULT
+        cot = dolar.get()
+        if cot is None:
+            if not dolar.loaded():
+                ttk.Label(
+                    frame, text="Cargando dólar…", foreground="#888"
+                ).pack(anchor="w")
+            else:
+                ttk.Label(
+                    frame,
+                    text=f"FOB total: USD {fob_total:,.2f}",
+                    foreground="#1a3a5c",
+                ).pack(anchor="w")
+                ttk.Label(
+                    frame,
+                    text="⚠️ No se pudo obtener el dólar",
+                    foreground="#c0392b",
+                ).pack(anchor="w")
+            return
+
+        costo_pesos = nacionalizado_usd * cot
+        precio_final = costo_pesos * GANANCIA_HERMANO_MULT
+        # Guardar el costo unitario por pack para que _render_ganancia lo use.
+        self._last_costo_unitario = precio_final
+
+        rows = [
+            (f"FOB unitario", f"USD {fob:,.2f}", "#1a3a5c", False),
+            (f"FOB total (×{mult})", f"USD {fob_total:,.2f}", "#1a3a5c", False),
+            (f"Nacionalizado (×{NACIONALIZACION_MULT})",
+             f"USD {nacionalizado_usd:,.2f}", "#1a3a5c", False),
+            (f"En pesos (×${cot:,.0f})",
+             format_price(costo_pesos), "#1a3a5c", False),
+            (f"+ ganancia (×{GANANCIA_HERMANO_MULT})",
+             format_price(precio_final), "#1e7a1e", True),
+        ]
+        for label, value, color, is_total in rows:
+            row = ttk.Frame(frame)
+            row.pack(fill="x", anchor="w", pady=1)
+            font = ("TkDefaultFont", 10, "bold") if is_total else ("TkDefaultFont", 10)
+            ttk.Label(row, text=label, font=font).pack(side="left")
+            tk.Label(row, text=value, foreground=color, font=font).pack(side="right")
+
     def _on_alt_click(self, event):
         row = self.tree.identify_row(event.y)
         if not row:
@@ -459,6 +778,370 @@ class VentasApp:
         self._open_url(url)
         return "break"
 
+    def _on_ctrl_shift_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row or self.tree.parent(row) == "":
+            return "break"
+        info = self.leaf_to_item.get(row)
+        if not info:
+            return "break"
+        sku = info.get("sku") or ""
+        if not sku:
+            self._flash_status("Esta venta no tiene SKU — no se puede cargar FOB")
+            return "break"
+        if not ventas_db.loaded():
+            self._flash_status("ventas_db todavía no cargó, esperá un segundo")
+            return "break"
+        self._open_fob_modal(sku, info.get("title") or "")
+        return "break"
+
+    def _open_fob_modal(self, sku: str, title: str):
+        win = tk.Toplevel(self.root)
+        win.title("Editar precio FOB")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        frame = ttk.Frame(win, padding=15)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text=title,
+            wraplength=420,
+            font=("TkDefaultFont", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+        ttk.Label(frame, text=f"SKU: {sku}", foreground="#666").pack(
+            anchor="w", pady=(0, 12)
+        )
+
+        ttk.Label(frame, text="Precio FOB (USD):").pack(anchor="w")
+        actual = ventas_db.get_fob(sku)
+        fob_var = tk.StringVar(value=f"{actual:.2f}" if actual else "")
+        entry = ttk.Entry(frame, textvariable=fob_var, width=20)
+        entry.pack(anchor="w", pady=(2, 12))
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        hint = ttk.Label(
+            frame,
+            text="Dejar vacío o 0 para borrar el FOB cargado.",
+            foreground="#888",
+            font=("TkDefaultFont", 9, "italic"),
+        )
+        hint.pack(anchor="w", pady=(0, 8))
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+
+        save_btn = ttk.Button(btns, text="Guardar")
+        cancel_btn = ttk.Button(btns, text="Cancelar", command=win.destroy)
+        save_btn.pack(side="right")
+        cancel_btn.pack(side="right", padx=(0, 6))
+
+        def do_save():
+            raw = fob_var.get().strip().replace(",", ".")
+            if raw == "":
+                new_fob = 0.0
+            else:
+                try:
+                    new_fob = float(raw)
+                except ValueError:
+                    self._flash_status("Valor inválido — debe ser un número")
+                    return
+                if new_fob < 0:
+                    self._flash_status("El FOB no puede ser negativo")
+                    return
+
+            save_btn.configure(state="disabled", text="Guardando...")
+            cancel_btn.configure(state="disabled")
+            entry.configure(state="disabled")
+
+            def worker():
+                try:
+                    ventas_db.set_fob(sku, new_fob)
+                except Exception as e:
+                    msg = str(e)
+                    self.root.after(
+                        0,
+                        lambda m=msg: self._fob_save_failed(
+                            win, save_btn, cancel_btn, entry, m
+                        ),
+                    )
+                    return
+                self.root.after(0, lambda: self._on_fob_saved(win, sku))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        save_btn.configure(command=do_save)
+        entry.bind("<Return>", lambda e: do_save())
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        # Centrar sobre la ventana principal.
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+
+    def _fob_save_failed(self, win, save_btn, cancel_btn, entry, msg):
+        save_btn.configure(state="normal", text="Guardar")
+        cancel_btn.configure(state="normal")
+        entry.configure(state="normal")
+        messagebox.showerror("Error", f"No se pudo guardar el FOB:\n{msg}", parent=win)
+
+    def _on_fob_saved(self, win, sku: str):
+        win.destroy()
+        self._flash_status(f"FOB guardado para {sku} ✓")
+        # Refrescar el detalle por si la fila visible es de este SKU.
+        self._on_select()
+
+    def _on_ctrl_shift_alt_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row or self.tree.parent(row) == "":
+            return "break"
+        info = self.leaf_to_item.get(row)
+        if not info:
+            return "break"
+        sku = info.get("sku") or ""
+        if not sku:
+            self._flash_status("Esta venta no tiene SKU — no se puede cargar multiplicador")
+            return "break"
+        if not ventas_db.loaded():
+            self._flash_status("ventas_db todavía no cargó, esperá un segundo")
+            return "break"
+        if ventas_db.get_fob(sku) is None:
+            self._flash_status(
+                "Cargá primero el precio FOB (Ctrl+Shift+Click)"
+            )
+            return "break"
+        self._open_mult_modal(sku, info.get("title") or "")
+        return "break"
+
+    def _open_mult_modal(self, sku: str, title: str):
+        win = tk.Toplevel(self.root)
+        win.title("Editar multiplicador")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        frame = ttk.Frame(win, padding=15)
+        frame.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frame,
+            text=title,
+            wraplength=420,
+            font=("TkDefaultFont", 11, "bold"),
+        ).pack(anchor="w", pady=(0, 4))
+        ttk.Label(frame, text=f"SKU: {sku}", foreground="#666").pack(
+            anchor="w", pady=(0, 12)
+        )
+
+        ttk.Label(frame, text="Multiplicador (unidades por publicación):").pack(
+            anchor="w"
+        )
+        actual = ventas_db.get_multiplicador(sku)
+        mult_var = tk.StringVar(value=str(actual) if actual else "")
+        entry = ttk.Entry(frame, textvariable=mult_var, width=12)
+        entry.pack(anchor="w", pady=(2, 12))
+        entry.focus_set()
+        entry.select_range(0, "end")
+
+        ttk.Label(
+            frame,
+            text="Entero ≥ 1. Para una publi de pack/12, poner 12.",
+            foreground="#888",
+            font=("TkDefaultFont", 9, "italic"),
+        ).pack(anchor="w", pady=(0, 8))
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+
+        save_btn = ttk.Button(btns, text="Guardar")
+        cancel_btn = ttk.Button(btns, text="Cancelar", command=win.destroy)
+        save_btn.pack(side="right")
+        cancel_btn.pack(side="right", padx=(0, 6))
+
+        def do_save():
+            raw = mult_var.get().strip()
+            try:
+                new_mult = int(raw)
+            except ValueError:
+                self._flash_status("Valor inválido — debe ser un entero ≥ 1")
+                return
+            if new_mult < 1:
+                self._flash_status("El multiplicador debe ser ≥ 1")
+                return
+
+            save_btn.configure(state="disabled", text="Guardando...")
+            cancel_btn.configure(state="disabled")
+            entry.configure(state="disabled")
+
+            def worker():
+                try:
+                    ventas_db.set_multiplicador(sku, new_mult)
+                except Exception as e:
+                    msg = str(e)
+                    self.root.after(
+                        0,
+                        lambda m=msg: self._mult_save_failed(
+                            win, save_btn, cancel_btn, entry, m
+                        ),
+                    )
+                    return
+                self.root.after(0, lambda: self._on_mult_saved(win, sku))
+
+            threading.Thread(target=worker, daemon=True).start()
+
+        save_btn.configure(command=do_save)
+        entry.bind("<Return>", lambda e: do_save())
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
+
+    def _mult_save_failed(self, win, save_btn, cancel_btn, entry, msg):
+        save_btn.configure(state="normal", text="Guardar")
+        cancel_btn.configure(state="normal")
+        entry.configure(state="normal")
+        messagebox.showerror("Error", f"No se pudo guardar el multiplicador:\n{msg}", parent=win)
+
+    def _on_mult_saved(self, win, sku: str):
+        win.destroy()
+        self._flash_status(f"Multiplicador guardado para {sku} ✓")
+        self._on_select()
+
+    def _open_totales_modal(self):
+        totales = self._calcular_totales_seleccionados()
+        selected_total = ventas_db.count_checked()
+
+        win = tk.Toplevel(self.root)
+        win.title("Totales de seleccionadas")
+        win.transient(self.root)
+
+        outer = ttk.Frame(win, padding=15)
+        outer.pack(fill="both", expand=True)
+
+        # Header
+        header_text = f"{totales['count_total']} ventas seleccionadas cargadas"
+        if selected_total > totales["count_total"]:
+            header_text += (
+                f"  ·  {selected_total - totales['count_total']} más en historial "
+                f"no cargado"
+            )
+        ttk.Label(
+            outer, text=header_text, font=("TkDefaultFont", 11, "bold")
+        ).pack(anchor="w", pady=(0, 10))
+
+        if totales["count_total"] == 0:
+            ttk.Label(
+                outer,
+                text="No hay ventas seleccionadas en las cargadas.",
+                foreground="#888",
+            ).pack(anchor="w")
+            ttk.Button(outer, text="Cerrar", command=win.destroy).pack(
+                anchor="e", pady=(15, 0)
+            )
+            win.bind("<Escape>", lambda e: win.destroy())
+            return
+
+        # Bloque de números
+        numbers = ttk.Frame(outer)
+        numbers.pack(fill="x", pady=(0, 10))
+
+        def add_row(parent, label, value, color, bold=False, big=False):
+            row = ttk.Frame(parent)
+            row.pack(fill="x", anchor="w", pady=2)
+            size = 12 if big else 10
+            font = ("TkDefaultFont", size, "bold") if bold else ("TkDefaultFont", size)
+            ttk.Label(row, text=label, font=font).pack(side="left")
+            tk.Label(
+                row, text=value, foreground=color, font=font
+            ).pack(side="right")
+
+        add_row(numbers, "Bruto MP", format_price(totales["bruto"]), "#1a3a5c")
+        add_row(numbers, "Neto MP", format_price(totales["neto_all"]), "#1e7a1e")
+
+        if totales["count_calc"] > 0:
+            ttk.Separator(numbers, orient="horizontal").pack(fill="x", pady=6)
+
+            cobertura_note = ""
+            if totales["count_calc"] < totales["count_total"]:
+                cobertura_note = (
+                    f"  (calculado sobre {totales['count_calc']} "
+                    f"de {totales['count_total']})"
+                )
+
+            add_row(
+                numbers,
+                f"Costo total{cobertura_note}",
+                f"- {format_price(totales['costo'])}",
+                "#c0392b",
+            )
+            ganancia_color = (
+                "#1e7a1e" if totales["ganancia"] >= 0 else "#c0392b"
+            )
+            add_row(
+                numbers,
+                "Ganancia",
+                format_price(totales["ganancia"]),
+                ganancia_color,
+                bold=True,
+                big=True,
+            )
+
+        # Listado de problemas
+        sin_costo = totales["sin_costo"]
+        if sin_costo:
+            ttk.Separator(outer, orient="horizontal").pack(fill="x", pady=(10, 8))
+            ttk.Label(
+                outer,
+                text=f"⚠ {len(sin_costo)} sin costo cargado:",
+                foreground="#d35400",
+                font=("TkDefaultFont", 10, "bold"),
+            ).pack(anchor="w", pady=(0, 4))
+
+            # Listbox con scroll por si hay muchos
+            list_frame = ttk.Frame(outer)
+            list_frame.pack(fill="both", expand=True)
+            lst = tk.Listbox(
+                list_frame,
+                height=min(8, len(sin_costo)),
+                width=70,
+                font=("TkDefaultFont", 9),
+                activestyle="none",
+            )
+            lst_vsb = ttk.Scrollbar(
+                list_frame, orient="vertical", command=lst.yview
+            )
+            lst.configure(yscrollcommand=lst_vsb.set)
+            lst.pack(side="left", fill="both", expand=True)
+            lst_vsb.pack(side="right", fill="y")
+
+            # Agrupar por SKU para no repetir si hay varias ventas del mismo
+            seen: dict[str, tuple[str, str]] = {}
+            for sku, title, motivo in sin_costo:
+                key = f"{sku}|{motivo}"
+                if key not in seen:
+                    seen[key] = (title, motivo)
+            for key, (title, motivo) in seen.items():
+                sku = key.split("|", 1)[0]
+                sku_part = sku if sku else "(sin SKU)"
+                title_part = title[:50] + ("…" if len(title) > 50 else "")
+                lst.insert("end", f"  [{motivo}]  {sku_part}  —  {title_part}")
+
+        ttk.Button(outer, text="Cerrar", command=win.destroy).pack(
+            anchor="e", pady=(15, 0)
+        )
+        win.bind("<Escape>", lambda e: win.destroy())
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")
+
     def _cargar_productos_async(self):
         def worker():
             try:
@@ -467,6 +1150,51 @@ class VentasApp:
             except Exception as e:
                 self.root.after(0, lambda: self._on_productos_cargados(0, str(e)))
         threading.Thread(target=worker, daemon=True).start()
+
+    def _cargar_dolar_async(self):
+        def worker():
+            dolar.cargar()
+            self.root.after(0, self._on_dolar_cargado)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_dolar_cargado(self):
+        cot = dolar.get()
+        if cot is None:
+            self.dolar_var.set("USD ✕")
+        else:
+            self.dolar_var.set(f"USD ${cot:,.0f}")
+        # Refrescar el detalle por si ya hay una fila seleccionada.
+        self._on_select()
+
+    def _cargar_ventas_db_async(self):
+        def worker():
+            try:
+                ventas_db.init_db()
+                self.root.after(0, self._on_ventas_db_cargada)
+            except Exception as e:
+                self.root.after(
+                    0, lambda m=str(e): self._flash_status(
+                        f"⚠️ Error cargando ventas_db: {m[:80]}", ms=5000
+                    )
+                )
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_ventas_db_cargada(self):
+        # Re-aplicar marcas a las filas ya cargadas (puede pasar si la API de ML
+        # respondió antes que la carga de Turso).
+        for leaf_id, order_id in self.row_to_order.items():
+            checked = ventas_db.is_checked(order_id)
+            values = list(self.tree.item(leaf_id, "values"))
+            values[0] = CHECKED if checked else UNCHECKED
+            self.tree.item(
+                leaf_id, values=values, tags=self._row_tags(leaf_id, order_id)
+            )
+        for parent in self.tree.get_children(""):
+            self._update_day_check(parent)
+        self._update_header_check()
+        self._update_status()
+        # Refrescar el detalle por si está mostrando un FOB.
+        self._on_select()
 
     def _on_productos_cargados(self, n: int, error: str | None):
         if error:
@@ -497,41 +1225,259 @@ class VentasApp:
             else:
                 self.btn_more.configure(state="disabled")
 
+    # ──────────────────── Filtro del Treeview ────────────────────
+
+    def _setup_filter_placeholder(
+        self, entry: ttk.Entry, var: tk.StringVar, placeholder: str
+    ) -> None:
+        """Placeholder gris que desaparece al hacer focus, igual que gestor-productos."""
+        def _on_focus_in(_e):
+            if entry.get() == placeholder:
+                entry.delete(0, "end")
+                entry.configure(foreground="")
+
+        def _on_focus_out(_e):
+            if not entry.get():
+                entry.insert(0, placeholder)
+                entry.configure(foreground="#888")
+
+        entry.insert(0, placeholder)
+        entry.configure(foreground="#888")
+        entry.bind("<FocusIn>", _on_focus_in)
+        entry.bind("<FocusOut>", _on_focus_out)
+
+    def _get_filter_text(self, var: tk.StringVar, placeholder: str) -> str:
+        """Texto del filtro ignorando el placeholder."""
+        val = var.get()
+        return "" if val == placeholder else val
+
+    def _refresh_leaf_meta(self, leaf_id: str):
+        """Recalcula el row_text del filtro a partir del info actual del leaf."""
+        meta = self._leaves_meta.get(leaf_id)
+        if not meta:
+            return
+        info = self.leaf_to_item.get(leaf_id) or {}
+        sku = info.get("sku") or ""
+        title = info.get("title") or ""
+        meta["row_text"] = _normalize(f"{sku} {title}")
+
+    def _limpiar_filtros(self):
+        # Limpiar SIN disparar el placeholder primero — seteamos en vacío y
+        # forzamos el placeholder solo si el entry no tiene focus.
+        for entry, var, placeholder in (
+            (self._buscar_entry, self._buscar_var, self._BUSCAR_PLACEHOLDER),
+            (self._excluir_entry, self._excluir_var, self._EXCLUIR_PLACEHOLDER),
+        ):
+            var.set("")
+            if self.root.focus_get() is not entry:
+                entry.insert(0, placeholder)
+                entry.configure(foreground="#888")
+
+    def _refresh_tree_filter(self):
+        """Aplica los filtros actuales sobre las leaves cargadas (detach/move)."""
+        buscar_raw = self._get_filter_text(self._buscar_var, self._BUSCAR_PLACEHOLDER)
+        excluir_raw = self._get_filter_text(
+            self._excluir_var, self._EXCLUIR_PLACEHOLDER
+        )
+        buscar_words = [_normalize(w) for w in buscar_raw.split() if w.strip()]
+        excluir_words = [_normalize(w) for w in excluir_raw.split() if w.strip()]
+        filter_active = bool(buscar_words or excluir_words)
+
+        # Decidir qué leaves quedan visibles, agrupados por día y en orden original.
+        visible_per_day: dict[str, list] = {}
+        for leaf_id, meta in sorted(
+            self._leaves_meta.items(), key=lambda kv: kv[1]["order"]
+        ):
+            row_text = meta["row_text"]
+            if buscar_words and not all(w in row_text for w in buscar_words):
+                continue
+            if excluir_words and all(w in row_text for w in excluir_words):
+                continue
+            visible_per_day.setdefault(meta["day_key"], []).append(leaf_id)
+
+        # Detach todas las leaves de todas las días (sin tocar los días en sí).
+        for day_parent_id in self.day_nodes.values():
+            for leaf_id in list(self.tree.get_children(day_parent_id)):
+                self.tree.detach(leaf_id)
+
+        # Reattach las visibles, en orden original dentro de cada día.
+        for day_key, leaf_ids in visible_per_day.items():
+            parent_id = self.day_nodes.get(day_key)
+            if not parent_id:
+                continue
+            for leaf_id in leaf_ids:
+                self.tree.move(leaf_id, parent_id, "end")
+
+        # Detach días vacíos. Reordenar los visibles por fecha desc.
+        sorted_days = sorted(
+            self.day_nodes.keys(),
+            key=lambda d: datetime.strptime(d, "%d/%m/%Y") if d else datetime.min,
+            reverse=True,
+        )
+        for day_key in sorted_days:
+            parent_id = self.day_nodes[day_key]
+            if self.tree.get_children(parent_id):
+                self.tree.move(parent_id, "", "end")
+            else:
+                self.tree.detach(parent_id)
+
+        # Refrescar checks y header del check global (puede cambiar el "todos marcados").
+        for parent in self.tree.get_children(""):
+            self._update_day_check(parent)
+        self._update_header_check()
+
+        # Status: cuando hay filtro, mostrar X de Y mostradas.
+        self._filter_active = filter_active
+        self._update_status()
+
+    def _calcular_totales_seleccionados(self) -> dict:
+        """Itera ventas cargadas y checkeadas, devuelve totales.
+
+        Solo incluye en el costo/ganancia las ventas con FOB + multiplicador
+        + cotización del dólar disponibles. Las que no, van a `sin_costo` con
+        un motivo para mostrar en el modal de detalle.
+        """
+        bruto = 0.0
+        neto_all = 0.0
+        neto_calc = 0.0
+        costo = 0.0
+        sin_costo: list[tuple[str, str, str]] = []
+        count_total = 0
+        count_calc = 0
+        cot = dolar.get()
+
+        # Iterar TODAS las leaves cargadas (incluso ocultas por el filtro),
+        # así los totales son independientes del filtro visual.
+        for leaf_id, order_id in self.row_to_order.items():
+            if not order_id or not ventas_db.is_checked(order_id):
+                continue
+            info = self.leaf_to_item.get(leaf_id) or {}
+            count_total += 1
+            bruto += float(info.get("total_amount") or 0)
+            neto_all += float(info.get("neto") or 0)
+
+            sku = info.get("sku") or ""
+            title = info.get("title") or ""
+            try:
+                quantity = int(info.get("quantity") or 1)
+            except (TypeError, ValueError):
+                quantity = 1
+
+            if not sku:
+                sin_costo.append(("", title, "sin SKU"))
+                continue
+            fob = ventas_db.get_fob(sku)
+            if not fob or fob <= 0:
+                sin_costo.append((sku, title, "sin FOB"))
+                continue
+            mult = ventas_db.get_multiplicador(sku)
+            if mult is None:
+                sin_costo.append((sku, title, "sin multiplicador"))
+                continue
+            if cot is None:
+                sin_costo.append((sku, title, "sin cotización dólar"))
+                continue
+
+            costo_unit = (
+                fob * mult * NACIONALIZACION_MULT * cot * GANANCIA_HERMANO_MULT
+            )
+            costo += costo_unit * quantity
+            neto_calc += float(info.get("neto") or 0)
+            count_calc += 1
+
+        return {
+            "count_total": count_total,
+            "count_calc": count_calc,
+            "bruto": bruto,
+            "neto_all": neto_all,
+            "neto_calc": neto_calc,
+            "costo": costo,
+            "ganancia": neto_calc - costo,
+            "sin_costo": sin_costo,
+        }
+
     def _update_status(self):
-        shown = len(self._all_leaves())
+        loaded = len(self._leaves_meta)
         days = len(self.tree.get_children(""))
-        self.status_var.set(
-            f"{shown} de {self.total} ventas en {days} días  •  "
-            f"{len(self.selected_ids)} seleccionadas"
+        if self._filter_active:
+            visible = len(self._all_leaves())
+            self.status_var.set(
+                f"{visible} de {loaded} cargadas (filtro)  •  "
+                f"{ventas_db.count_checked()} seleccionadas"
+            )
+        else:
+            self.status_var.set(
+                f"{loaded} de {self.total} ventas en {days} días  •  "
+                f"{ventas_db.count_checked()} seleccionadas"
+            )
+        self._update_totales_inline()
+
+    def _update_totales_inline(self):
+        """Refresca el mini totalizador de la barra inferior."""
+        totales = self._calcular_totales_seleccionados()
+        if totales["count_total"] == 0:
+            self.totales_costo_var.set("")
+            self.totales_ganancia_var.set("")
+            return
+        self.totales_costo_var.set(f"Costo: {format_price(totales['costo'])}")
+        self.totales_ganancia_var.set(
+            f"Ganancia: {format_price(totales['ganancia'])}"
+        )
+        self.totales_ganancia_lbl.configure(
+            foreground="#1e7a1e" if totales["ganancia"] >= 0 else "#c0392b"
         )
 
-    def _save(self):
-        try:
-            save_selections(self.selected_ids)
-        except OSError as e:
-            messagebox.showerror("Error", f"No se pudo guardar selecciones:\n{e}")
+    def _persist_check_async(self, order_id: str, checked: bool):
+        """Escribe el check en Turso en background. Si falla, revierte la cache y la UI."""
+        def worker():
+            try:
+                ventas_db.persist_check(order_id, checked)
+            except Exception as e:
+                self.root.after(
+                    0, lambda m=str(e): self._on_check_failed(order_id, checked, m)
+                )
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_check_failed(self, order_id: str, attempted: bool, error: str):
+        # Rollback en cache
+        ventas_db.mark_local(order_id, not attempted)
+        # Re-render todas las filas con ese order_id (puede haber más de una si hay duplicados)
+        for leaf_id, oid in self.row_to_order.items():
+            if oid != order_id:
+                continue
+            values = list(self.tree.item(leaf_id, "values"))
+            values[0] = CHECKED if not attempted else UNCHECKED
+            self.tree.item(
+                leaf_id, values=values, tags=self._row_tags(leaf_id, order_id)
+            )
+            parent = self.tree.parent(leaf_id)
+            if parent:
+                self._update_day_check(parent)
+        self._update_header_check()
+        self._update_status()
+        self._flash_status(f"⚠️ Error guardando check: {error[:80]}", ms=4000)
 
     def _set_leaf_check(self, leaf_id: str, checked: bool):
         order_id = self.row_to_order.get(leaf_id)
         if not order_id:
             return
-        if checked:
-            self.selected_ids.add(order_id)
-        else:
-            self.selected_ids.discard(order_id)
+        # Update optimista en cache (sync, main thread)
+        ventas_db.mark_local(order_id, checked)
+        # Update visual
         values = list(self.tree.item(leaf_id, "values"))
         values[0] = CHECKED if checked else UNCHECKED
         self.tree.item(leaf_id, values=values, tags=self._row_tags(leaf_id, order_id))
+        # Persist en background
+        self._persist_check_async(order_id, checked)
 
     def _toggle(self, leaf_id: str):
         order_id = self.row_to_order.get(leaf_id)
         if order_id is None:
             return
-        self._set_leaf_check(leaf_id, order_id not in self.selected_ids)
+        self._set_leaf_check(leaf_id, not ventas_db.is_checked(order_id))
         parent = self.tree.parent(leaf_id)
         if parent:
             self._update_day_check(parent)
-        self._save()
         self._update_header_check()
         self._update_status()
 
@@ -540,12 +1486,11 @@ class VentasApp:
         if not leaves:
             return
         all_checked = all(
-            self.row_to_order.get(l) in self.selected_ids for l in leaves
+            ventas_db.is_checked(self.row_to_order.get(l) or "") for l in leaves
         )
         for l in leaves:
             self._set_leaf_check(l, not all_checked)
         self._update_day_check(parent_id)
-        self._save()
         self._update_header_check()
         self._update_status()
 
@@ -554,13 +1499,12 @@ class VentasApp:
         if not leaves:
             return
         all_checked = all(
-            self.row_to_order.get(l) in self.selected_ids for l in leaves
+            ventas_db.is_checked(self.row_to_order.get(l) or "") for l in leaves
         )
         for l in leaves:
             self._set_leaf_check(l, not all_checked)
         for parent in self.tree.get_children(""):
             self._update_day_check(parent)
-        self._save()
         self._update_header_check()
         self._update_status()
 
@@ -569,7 +1513,7 @@ class VentasApp:
         if not leaves:
             return
         all_checked = all(
-            self.row_to_order.get(l) in self.selected_ids for l in leaves
+            ventas_db.is_checked(self.row_to_order.get(l) or "") for l in leaves
         )
         values = list(self.tree.item(parent_id, "values"))
         values[0] = CHECKED if all_checked else UNCHECKED
@@ -578,7 +1522,7 @@ class VentasApp:
     def _update_header_check(self):
         leaves = self._all_leaves()
         if leaves and all(
-            self.row_to_order.get(l) in self.selected_ids for l in leaves
+            ventas_db.is_checked(self.row_to_order.get(l) or "") for l in leaves
         ):
             self.tree.heading("check", text=CHECKED)
         else:
@@ -586,7 +1530,7 @@ class VentasApp:
 
     def _row_tags(self, row_id: str, order_id: str) -> tuple:
         base = self.row_base.get(row_id, "even")
-        if order_id in self.selected_ids:
+        if ventas_db.is_checked(order_id):
             return ("selected",)
         return (base,)
 
@@ -752,6 +1696,7 @@ class VentasApp:
             # values = (check, time, sku, title, price)
             values[2] = new_sku
             self.tree.item(leaf_id, values=values)
+        self._refresh_leaf_meta(leaf_id)
         win.destroy()
         self._flash_status(f"SKU actualizado: {new_sku}")
 
@@ -1037,6 +1982,7 @@ class VentasApp:
             values = list(self.tree.item(leaf_id, "values"))
             values[2] = new_sku
             self.tree.item(leaf_id, values=values)
+        self._refresh_leaf_meta(leaf_id)
         self._flash_status(f"SKU actual: {new_sku or '(vacío)'}")
 
     def _copy_clicked_title(self):
@@ -1123,7 +2069,7 @@ class VentasApp:
             day_key = parent_to_day.get(parent_id, "")
             for leaf_id in self.tree.get_children(parent_id):
                 order_id = self.row_to_order.get(leaf_id)
-                if order_id not in self.selected_ids:
+                if not order_id or not ventas_db.is_checked(order_id):
                     continue
                 values = self.tree.item(leaf_id, "values")
                 _, time_str, sku, qty, title, price_str, subtotal_str = values
@@ -1147,7 +2093,7 @@ class VentasApp:
         return ordered, days, grand_total, count
 
     def _copy_selected_to_clipboard(self):
-        if not self.selected_ids:
+        if ventas_db.count_checked() == 0:
             self._flash_status("No hay ventas seleccionadas")
             return
         ordered, days, grand_total, total_count = self._collect_selected()
@@ -1173,7 +2119,7 @@ class VentasApp:
         self._flash_status(f"Copiado al portapapeles ✓ ({total_count} ventas)")
 
     def export_excel(self):
-        if not self.selected_ids:
+        if ventas_db.count_checked() == 0:
             self._flash_status("No hay ventas seleccionadas")
             return
         ordered, days, grand_total, count = self._collect_selected()
@@ -1287,26 +2233,40 @@ class VentasApp:
 
         self._flash_status(f"Exportado: {os.path.basename(path)} ({count} ventas)")
 
-    def _show_hint(self, modifier: str):
-        if self._hint_active == modifier:
+    def _modifier_pressed(self, modifier: str):
+        if modifier in self._modifiers_active:
             return  # auto-repeat de KeyPress, ignorar
-        if self._hint_active is None:
+        if not self._modifiers_active:
             self._status_before_hint = self.status_var.get()
-        self._hint_active = modifier
-        if modifier == "ctrl":
-            self.status_var.set("⌨ Ctrl + click → abrir publicación en el browser")
-        else:
-            self.status_var.set("⌨ Shift + click → abrir detalle de la venta")
+        self._modifiers_active.add(modifier)
+        self._refresh_modifier_hint()
 
-    def _hide_hint(self, modifier: str):
-        if self._hint_active != modifier:
+    def _modifier_released(self, modifier: str):
+        if modifier not in self._modifiers_active:
             return
-        self._hint_active = None
-        # Restaurar el status previo (o recalcular si era de selección).
-        if self._status_before_hint:
-            self.status_var.set(self._status_before_hint)
+        self._modifiers_active.discard(modifier)
+        if self._modifiers_active:
+            self._refresh_modifier_hint()
         else:
-            self._update_status()
+            if self._status_before_hint:
+                self.status_var.set(self._status_before_hint)
+            else:
+                self._update_status()
+
+    def _refresh_modifier_hint(self):
+        mods = self._modifiers_active
+        if "ctrl" in mods and "shift" in mods and "alt" in mods:
+            self.status_var.set(
+                "⌨ Ctrl+Shift+Alt + click → editar multiplicador"
+            )
+        elif "ctrl" in mods and "shift" in mods:
+            self.status_var.set("⌨ Ctrl+Shift + click → editar precio FOB")
+        elif "ctrl" in mods:
+            self.status_var.set("⌨ Ctrl + click → abrir publicación en el browser")
+        elif "shift" in mods:
+            self.status_var.set("⌨ Shift + click → abrir detalle de la venta")
+        elif "alt" in mods:
+            self.status_var.set("⌨ Alt + click → abrir cobro en Mercado Pago")
 
     def _flash_status(self, msg: str, ms: int = 2500):
         prev = self.status_var.get()
@@ -1345,23 +2305,15 @@ class VentasApp:
         self.day_nodes.clear()
         self.day_count.clear()
         self.day_total.clear()
+        self._leaves_meta.clear()
+        self._leaf_order_counter = 0
         self.offset = 0
-        self.selected_ids = load_selections()
         self._cargar_productos_async()
         self._fetch_async(append=False)
 
     def load_more(self):
         if self.loading:
             return
-        self.selected_ids = load_selections()
-        # Re-aplicar marcas a las filas ya cargadas por si cambió el JSON externamente.
-        for leaf_id, order_id in self.row_to_order.items():
-            mark = CHECKED if order_id in self.selected_ids else UNCHECKED
-            values = list(self.tree.item(leaf_id, "values"))
-            values[0] = mark
-            self.tree.item(leaf_id, values=values, tags=self._row_tags(leaf_id, order_id))
-        for parent in self.tree.get_children(""):
-            self._update_day_check(parent)
         self._fetch_async(append=True)
 
     def _fetch_async(self, append: bool):
@@ -1419,9 +2371,10 @@ class VentasApp:
             order_id = str(order.get("id", ""))
 
             parent_id = self._get_or_create_day(day_key)
-            mark = CHECKED if order_id in self.selected_ids else UNCHECKED
+            checked = ventas_db.is_checked(order_id)
+            mark = CHECKED if checked else UNCHECKED
             base = "odd" if (start_idx + i) % 2 else "even"
-            tags = ("selected",) if order_id in self.selected_ids else (base,)
+            tags = ("selected",) if checked else (base,)
             leaf_id = self.tree.insert(
                 parent_id,
                 "end",
@@ -1430,6 +2383,13 @@ class VentasApp:
             )
             self.row_to_order[leaf_id] = order_id
             self.row_base[leaf_id] = base
+            # Meta para el filtro: día + texto normalizado para matchear.
+            self._leaves_meta[leaf_id] = {
+                "day_key": day_key,
+                "row_text": _normalize(f"{sku} {title}"),
+                "order": self._leaf_order_counter,
+            }
+            self._leaf_order_counter += 1
             # Datos de pago / comisiones para el panel de detalle
             payments = order.get("payments") or []
             first_payment = payments[0] if payments else {}
@@ -1485,6 +2445,10 @@ class VentasApp:
         self.offset += len(results)
         self._update_header_check()
         self._set_loading(False)
+
+        # Si hay filtro activo, aplicarlo a las filas nuevas también.
+        if self._filter_active:
+            self._refresh_tree_filter()
 
         # Disparar refresco de SKUs en background: el endpoint /orders devuelve
         # snapshot histórico del item, así que el SKU puede estar desactualizado.
@@ -1566,6 +2530,7 @@ class VentasApp:
                 values = list(self.tree.item(lid, "values"))
                 values[2] = new_sku
                 self.tree.item(lid, values=values)
+            self._refresh_leaf_meta(lid)
         self._flash_status(f"SKUs sincronizados ({len(updates)})")
 
     def _get_or_create_day(self, day_key: str) -> str:
