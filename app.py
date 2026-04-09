@@ -17,8 +17,7 @@ from PIL import Image, ImageTk
 
 import dolar
 import frase
-import productos_lookup
-import ventas_db
+import local_store
 import whatsapp_send
 
 # WSL no sincroniza el clipboard de Tk (X11/WSLg) con el de Windows.
@@ -113,7 +112,7 @@ def format_price(value) -> str:
 
 
 def _normalize(text: str) -> str:
-    """Minúsculas + sin acentos/tildes (mismo helper que gestor-productos)."""
+    """Minúsculas + sin acentos/tildes."""
     text = (text or "").lower()
     nfkd = unicodedata.normalize("NFD", text)
     return "".join(c for c in nfkd if unicodedata.category(c) != "Mn")
@@ -124,11 +123,13 @@ def _normalize(text: str) -> str:
 NACIONALIZACION_MULT = 1.9
 GANANCIA_HERMANO_MULT = 1.30
 
-# Pago promedio a Héctor por entregar un envío Flex (self_service).
-# Es un costo externo a ML/MP que no aparece en ningún endpoint del API,
-# por eso lo modelamos acá como constante. Aproximación inicial; cuando
-# Pablo me pase el número exacto (o la regla por zona/peso) se actualiza.
-PAGO_HECTOR_FLEX = 6500.0
+# Heurístico de shipping al seller. NO hacemos llamadas a /shipments/{id}/costs
+# porque metían cientos de requests por carga. En su lugar estimamos:
+# si la order tiene shipment y total_amount supera el umbral de envío
+# gratis de ML, asumimos que el seller paga ~SHIPPING_FREE_RATE del total.
+# Es deliberadamente grosero — ajustar a ojo.
+SHIPPING_FREE_THRESHOLD = 30000.0  # ARS, umbral aproximado de "envío gratis ML"
+SHIPPING_FREE_RATE = 0.07          # 7% del total cuando el seller paga
 
 
 class VentasApp:
@@ -158,15 +159,12 @@ class VentasApp:
         self._leaves_meta: dict = {}  # leaf_id -> {"day_key", "row_text", "order"}
         self._leaf_order_counter = 0  # contador para preservar orden de inserción
         self._filter_active = False
-        # Cache de costos de envío reales por shipment_id (proceso, no disco).
-        # Lo llena `_refresh_shipping_costs_batch` para evitar re-pegarle a
-        # /shipments/{id}/costs si la misma orden ya pasó por la app.
-        self._shipping_cost_cache: dict = {}
+
+        # Carga local del JSON (sync, instantánea).
+        local_store.init()
 
         self._build_ui()
-        self._cargar_productos_async()
         self._cargar_dolar_async()
-        self._cargar_ventas_db_async()
         self.refresh()
 
     def _build_ui(self):
@@ -199,7 +197,7 @@ class VentasApp:
         tree_frame = ttk.Frame(paned)
         paned.add(tree_frame, weight=3)
 
-        # ─── Filter bar (mismo estilo funcional que gestor-productos) ───
+        # ─── Filter bar ───
         filter_bar = ttk.Frame(tree_frame)
         filter_bar.pack(side="top", fill="x", pady=(0, 6))
 
@@ -233,8 +231,8 @@ class VentasApp:
         ).pack(side="left")
 
         # Toggle "solo con nota" — filtra el tree para mostrar únicamente
-        # ventas que tienen una nota asociada en ventas_db (casos que el
-        # usuario marcó como "sospechosos para revisar después").
+        # ventas que tienen una nota asociada (casos que el usuario marcó
+        # como "sospechosos para revisar después").
         self._solo_con_nota_var = tk.BooleanVar(value=False)
         self._solo_con_nota_chk = ttk.Checkbutton(
             filter_bar,
@@ -369,9 +367,6 @@ class VentasApp:
             command=self._copy_selected_to_clipboard,
         )
         self.context_menu.add_separator()
-        self.context_menu.add_command(
-            label="Refrescar fila", command=self._refresh_clicked_row
-        )
         self.context_menu.add_command(label="Refrescar todo", command=self.refresh)
         self.context_menu.bind("<FocusOut>", lambda e: self.context_menu.unpost())
         self._right_clicked_row = None
@@ -461,8 +456,30 @@ class VentasApp:
             font=("TkDefaultFont", 10, "bold"),
         ).pack(anchor="w", pady=(8, 4))
 
+        # Chips de etiquetas asignadas al SKU actual.
         self.detail_tags_frame = ttk.Frame(self.detail_frame)
         self.detail_tags_frame.pack(fill="x", anchor="w")
+
+        # Combobox para elegir/agregar una etiqueta del catálogo + botón "+"
+        # para crear una etiqueta nueva al catálogo. SKU actual cacheado para
+        # que los handlers sepan a qué venta aplicar.
+        self._detail_current_sku: str | None = None
+        tag_picker = ttk.Frame(self.detail_frame)
+        tag_picker.pack(fill="x", anchor="w", pady=(4, 0))
+        self._tag_combo_var = tk.StringVar()
+        self._tag_combo = ttk.Combobox(
+            tag_picker,
+            textvariable=self._tag_combo_var,
+            state="readonly",
+            width=18,
+        )
+        self._tag_combo.pack(side="left", padx=(0, 4))
+        ttk.Button(
+            tag_picker, text="Agregar", width=8, command=self._on_add_tag_click
+        ).pack(side="left")
+        ttk.Button(
+            tag_picker, text="+", width=2, command=self._on_new_tag_click
+        ).pack(side="left", padx=(4, 0))
 
         ttk.Separator(self.detail_frame, orient="horizontal").pack(
             fill="x", pady=(12, 8)
@@ -512,8 +529,8 @@ class VentasApp:
         self.detail_ganancia_frame.pack(fill="x", anchor="w")
 
         # ─── Nota libre por venta ───
-        # Persistida en ventas_db (tabla ventas_notas) por order_id.
-        # Autosave on focus-out con thread async para no bloquear la UI.
+        # Persistida en local_store (data.json) por order_id.
+        # Autosave on focus-out, sync (escritura local instantánea).
         ttk.Separator(self.detail_frame, orient="horizontal").pack(
             fill="x", pady=(16, 6)
         )
@@ -565,17 +582,16 @@ class VentasApp:
         self._flush_nota_pendiente()
         if not info:
             # Es una fila de día, no una venta
-            self._update_detail(None, None, None)
+            self._update_detail(None, None)
             self._load_nota_into_widget(None)
             return
         sku = info.get("sku") or ""
-        producto = productos_lookup.get(sku) if sku else None
-        self._update_detail(sku, producto, info)
+        self._update_detail(sku, info)
         order_id = self.row_to_order.get(leaf_id)
         self._load_nota_into_widget(order_id)
 
-    def _update_detail(self, sku: str | None, producto: dict | None, info: dict | None):
-        # Limpiar chips anteriores
+    def _update_detail(self, sku: str | None, info: dict | None):
+        # Limpiar contenido anterior
         for w in self.detail_tags_frame.winfo_children():
             w.destroy()
         for w in self.detail_payment_frame.winfo_children():
@@ -586,59 +602,155 @@ class VentasApp:
             w.destroy()
 
         # Reset del costo unitario calculado (lo setea _render_costo si puede).
-        # _render_costo va antes que _render_ganancia porque la ganancia
-        # depende del costo total calculado acá.
         self._last_costo_unitario = None
-        self._render_costo(producto, sku)
+        self._render_costo(sku)
         self._render_payment(info)
         self._render_ganancia(info)
+
+        # Cachear SKU para el picker de etiquetas.
+        self._detail_current_sku = sku or None
 
         if sku is None:
             self.detail_status_var.set("Seleccioná una venta")
             self.detail_status_lbl.configure(foreground="#888")
-            return
-
-        if not productos_lookup.loaded():
-            self.detail_status_var.set("Cargando productos…")
-            self.detail_status_lbl.configure(foreground="#888")
+            self._refresh_tag_picker()
             return
 
         if not sku:
             self.detail_status_var.set("⚠️ Esta venta no tiene SKU")
             self.detail_status_lbl.configure(foreground="#c0392b")
+            self._refresh_tag_picker()
             return
 
-        if not producto:
-            self.detail_status_var.set(
-                f"⚠️ SKU {sku} no encontrado en gestor-productos"
-            )
-            self.detail_status_lbl.configure(foreground="#c0392b")
-            return
-
-        nombre = producto.get("nombre") or ""
-        self.detail_status_var.set(f"{sku}\n{nombre}")
+        title = (info or {}).get("title") or ""
+        self.detail_status_var.set(f"{sku}\n{title}")
         self.detail_status_lbl.configure(foreground="#333")
+        self._refresh_tag_picker()
 
-        etiquetas_raw = producto.get("etiquetas") or ""
-        etiquetas = [e.strip() for e in etiquetas_raw.split(",") if e.strip()]
-        if not etiquetas:
+    # ────────────── Etiquetas locales (chips + dropdown) ──────────────
+
+    def _refresh_tag_picker(self):
+        """Redibuja chips de etiquetas asignadas + actualiza el combobox con
+        las etiquetas del catálogo que todavía no están asignadas a este SKU."""
+        for w in self.detail_tags_frame.winfo_children():
+            w.destroy()
+
+        sku = self._detail_current_sku
+        if not sku:
+            ttk.Label(
+                self.detail_tags_frame,
+                text="(seleccioná una venta con SKU)",
+                foreground="#888",
+            ).pack(anchor="w")
+            self._tag_combo.configure(values=[], state="disabled")
+            self._tag_combo_var.set("")
+            return
+
+        asignadas = local_store.get_etiquetas_sku(sku)
+        if not asignadas:
             ttk.Label(
                 self.detail_tags_frame,
                 text="(sin etiquetas)",
                 foreground="#888",
             ).pack(anchor="w")
+        else:
+            for et in asignadas:
+                row = tk.Frame(self.detail_tags_frame, background="#dce6f0")
+                row.pack(anchor="w", pady=2)
+                tk.Label(
+                    row,
+                    text=et,
+                    background="#dce6f0",
+                    foreground="#1a3a5c",
+                    padx=8,
+                    pady=2,
+                    borderwidth=0,
+                ).pack(side="left")
+                tk.Label(
+                    row,
+                    text=" ✕ ",
+                    background="#dce6f0",
+                    foreground="#c0392b",
+                    cursor="hand2",
+                    padx=2,
+                ).pack(side="left")
+                # Bind del ✕ — captura el nombre actual.
+                row.winfo_children()[1].bind(
+                    "<Button-1>",
+                    lambda _e, et=et: self._on_remove_tag(et),
+                )
+
+        # Combobox: catálogo menos lo ya asignado.
+        catalogo = local_store.etiquetas_catalogo()
+        disponibles = [e for e in catalogo if e not in asignadas]
+        if disponibles:
+            self._tag_combo.configure(values=disponibles, state="readonly")
+            self._tag_combo_var.set("")
+        else:
+            self._tag_combo.configure(values=[], state="disabled")
+            self._tag_combo_var.set("")
+
+    def _on_add_tag_click(self):
+        sku = self._detail_current_sku
+        et = (self._tag_combo_var.get() or "").strip()
+        if not sku or not et:
             return
-        for et in etiquetas:
-            chip = tk.Label(
-                self.detail_tags_frame,
-                text=et,
-                background="#dce6f0",
-                foreground="#1a3a5c",
-                padx=8,
-                pady=2,
-                borderwidth=0,
-            )
-            chip.pack(anchor="w", pady=2)
+        local_store.add_etiqueta_a_sku(sku, et)
+        self._refresh_tag_picker()
+
+    def _on_remove_tag(self, etiqueta: str):
+        sku = self._detail_current_sku
+        if not sku:
+            return
+        local_store.remove_etiqueta_de_sku(sku, etiqueta)
+        self._refresh_tag_picker()
+
+    def _on_new_tag_click(self):
+        """Modal chico para crear una etiqueta nueva al catálogo."""
+        win = tk.Toplevel(self.root)
+        win.title("Nueva etiqueta")
+        win.transient(self.root)
+        win.resizable(False, False)
+        frame = ttk.Frame(win, padding=15)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Nombre de la etiqueta:").pack(anchor="w")
+        var = tk.StringVar()
+        entry = ttk.Entry(frame, textvariable=var, width=24)
+        entry.pack(anchor="w", pady=(2, 12))
+        entry.focus_set()
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill="x")
+
+        def do_save():
+            et = (var.get() or "").strip()
+            if not et:
+                win.destroy()
+                return
+            agregada = local_store.add_etiqueta_catalogo(et)
+            # Si hay un SKU activo, asignarla automáticamente.
+            sku = self._detail_current_sku
+            if sku:
+                local_store.add_etiqueta_a_sku(sku, et)
+            win.destroy()
+            self._refresh_tag_picker()
+            if agregada:
+                self._flash_status(f"Etiqueta agregada: {et}")
+            else:
+                self._flash_status(f"Etiqueta ya existía: {et}")
+
+        ttk.Button(btns, text="Guardar", command=do_save).pack(side="right")
+        ttk.Button(btns, text="Cancelar", command=win.destroy).pack(
+            side="right", padx=(0, 6)
+        )
+        entry.bind("<Return>", lambda _e: do_save())
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
+        win.geometry(f"+{x}+{y}")
+        win.grab_set()
 
     def _render_payment(self, info: dict | None):
         if not info or info.get("payment_id") is None:
@@ -653,18 +765,10 @@ class VentasApp:
             ("Bruto", info.get("total_amount") or 0, "#1a3a5c"),
             ("Comisión ML", -(info.get("sale_fee") or 0), "#c0392b"),
         ]
-        # El envío real no viene en el listado de orders — `shipping_loaded`
-        # marca si ya llegó la respuesta de /shipments/{id}/costs.
-        if not info.get("shipping_loaded"):
-            rows.append(("Envío", "cargando…", "#888"))
-        elif info.get("shipping_cost"):
-            rows.append(("Envío", -(info.get("shipping_cost") or 0), "#c0392b"))
-        # Pago a Héctor (solo en Flex). Es un costo externo que no viene del
-        # API; lo aplica _on_shipping_cost_loaded como constante.
-        if info.get("pago_hector"):
-            rows.append(
-                ("Pago Héctor (Flex)", -(info.get("pago_hector") or 0), "#c0392b")
-            )
+        # El shipping cost es un heurístico calculado al cargar la order
+        # (ver _on_data). No hay llamadas extra a /shipments.
+        if info.get("shipping_cost"):
+            rows.append(("Envío (estimado)", -(info.get("shipping_cost") or 0), "#c0392b"))
         if info.get("taxes_amount"):
             rows.append(("Impuestos", -(info.get("taxes_amount") or 0), "#c0392b"))
         rows.append(("Neto", info.get("neto") or 0, "#1e7a1e"))
@@ -714,54 +818,6 @@ class VentasApp:
             foreground="#888",
             font=("TkDefaultFont", 9),
         ).pack(anchor="w")
-
-        # Chips de tipo de envío para que sea claro qué cubre el cálculo:
-        # - Flex (self_service + cost 0): el seller hace el delivery, lo
-        #   paga afuera (a Héctor en el caso de Pablo), y MP le suma una
-        #   bonificación que el API público no expone. Por eso ese caso es
-        #   el más "ciego" del cálculo.
-        # - Mercado Envíos: ML maneja la logística y el cost al seller
-        #   ya está reflejado en la línea "Envío" arriba (viene de
-        #   /shipments/{id}/costs → senders[0].cost). Cálculo confiable.
-        if info.get("shipping_loaded"):
-            is_flex = (
-                info.get("logistic_type") == "self_service"
-                and float(info.get("shipping_cost") or 0) == 0
-            )
-            if is_flex:
-                tk.Label(
-                    self.detail_payment_frame,
-                    text="  ⚡ Flex (Héctor descontado)  ",
-                    foreground="white",
-                    background="#d35400",
-                    font=("TkDefaultFont", 9, "bold"),
-                ).pack(anchor="w", pady=(8, 0))
-                ttk.Label(
-                    self.detail_payment_frame,
-                    text=(
-                        f"Se descontó el pago promedio a Héctor "
-                        f"({format_price(PAGO_HECTOR_FLEX)}).\n"
-                        "MP te suma una bonificación por el envío que el\n"
-                        "API no expone — el real puede ser un poco mayor."
-                    ),
-                    foreground="#888",
-                    font=("TkDefaultFont", 9, "italic"),
-                    justify="left",
-                ).pack(anchor="w")
-            else:
-                tk.Label(
-                    self.detail_payment_frame,
-                    text="  📦 Mercado Envíos  ",
-                    foreground="white",
-                    background="#1f4e9d",
-                    font=("TkDefaultFont", 9, "bold"),
-                ).pack(anchor="w", pady=(8, 0))
-                ttk.Label(
-                    self.detail_payment_frame,
-                    text="El costo del envío ya está descontado arriba.",
-                    foreground="#888",
-                    font=("TkDefaultFont", 9, "italic"),
-                ).pack(anchor="w")
 
     def _render_ganancia(self, info: dict | None):
         frame = self.detail_ganancia_frame
@@ -871,7 +927,7 @@ class VentasApp:
         self._nota_current_order = order_id
         self.detail_nota_text.delete("1.0", "end")
         if order_id:
-            nota = ventas_db.get_nota(order_id)
+            nota = local_store.get_nota(order_id)
             if nota:
                 self.detail_nota_text.insert("1.0", nota)
         self._nota_loading = False
@@ -884,14 +940,11 @@ class VentasApp:
         if not order_id:
             return
         nuevo = self.detail_nota_text.get("1.0", "end-1c").strip()
-        viejo = ventas_db.get_nota(order_id)
+        viejo = local_store.get_nota(order_id)
         if nuevo == viejo:
             return
-        # Update optimista en cache + tag visual + filtro.
-        ventas_db.set_nota_local(order_id, nuevo)
+        local_store.set_nota(order_id, nuevo)
         self._refresh_leaf_nota_tag(order_id)
-        # Persist en background.
-        self._persist_nota_async(order_id, nuevo)
         self._update_status()
 
     def _flush_nota_pendiente(self):
@@ -904,12 +957,11 @@ class VentasApp:
         if not order_id:
             return
         nuevo = self.detail_nota_text.get("1.0", "end-1c").strip()
-        viejo = ventas_db.get_nota(order_id)
+        viejo = local_store.get_nota(order_id)
         if nuevo == viejo:
             return
-        ventas_db.set_nota_local(order_id, nuevo)
+        local_store.set_nota(order_id, nuevo)
         self._refresh_leaf_nota_tag(order_id)
-        self._persist_nota_async(order_id, nuevo)
 
     def _refresh_leaf_nota_tag(self, order_id: str):
         """Actualiza el tag visual del row del tree para que aparezca/desaparezca
@@ -928,31 +980,14 @@ class VentasApp:
         if self._solo_con_nota_var.get():
             self._refresh_tree_filter()
 
-    def _persist_nota_async(self, order_id: str, nota: str):
-        def worker():
-            try:
-                ventas_db.persist_nota(order_id, nota)
-            except Exception as e:
-                self.root.after(
-                    0, lambda m=str(e): self._flash_status(
-                        f"⚠️ Error guardando nota: {m[:80]}", ms=4000
-                    )
-                )
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _render_costo(self, producto: dict | None, sku: str | None):
+    def _render_costo(self, sku: str | None):
         frame = self.detail_costo_frame
         if not sku:
             ttk.Label(
                 frame, text="(sin SKU)", foreground="#888"
             ).pack(anchor="w")
             return
-        if not ventas_db.loaded():
-            ttk.Label(
-                frame, text="Cargando…", foreground="#888"
-            ).pack(anchor="w")
-            return
-        fob = ventas_db.get_fob(sku)
+        fob = local_store.get_fob(sku)
         if not fob or fob <= 0:
             ttk.Label(
                 frame,
@@ -967,7 +1002,7 @@ class VentasApp:
             ).pack(anchor="w")
             return
 
-        mult = ventas_db.get_multiplicador(sku)
+        mult = local_store.get_multiplicador(sku)
         if mult is None:
             # FOB cargado pero falta el multiplicador → no se puede calcular nada.
             row = ttk.Frame(frame)
@@ -1080,9 +1115,6 @@ class VentasApp:
         if not sku:
             self._flash_status("Esta venta no tiene SKU — no se puede cargar FOB")
             return "break"
-        if not ventas_db.loaded():
-            self._flash_status("ventas_db todavía no cargó, esperá un segundo")
-            return "break"
         self._open_fob_modal(sku, info.get("title") or "")
         return "break"
 
@@ -1106,7 +1138,7 @@ class VentasApp:
         )
 
         ttk.Label(frame, text="Precio FOB (USD):").pack(anchor="w")
-        actual = ventas_db.get_fob(sku)
+        actual = local_store.get_fob(sku)
         fob_var = tk.StringVar(value=f"{actual:.2f}" if actual else "")
         entry = ttk.Entry(frame, textvariable=fob_var, width=20)
         entry.pack(anchor="w", pady=(2, 12))
@@ -1142,26 +1174,14 @@ class VentasApp:
                 if new_fob < 0:
                     self._flash_status("El FOB no puede ser negativo")
                     return
-
-            save_btn.configure(state="disabled", text="Guardando...")
-            cancel_btn.configure(state="disabled")
-            entry.configure(state="disabled")
-
-            def worker():
-                try:
-                    ventas_db.set_fob(sku, new_fob)
-                except Exception as e:
-                    msg = str(e)
-                    self.root.after(
-                        0,
-                        lambda m=msg: self._fob_save_failed(
-                            win, save_btn, cancel_btn, entry, m
-                        ),
-                    )
-                    return
-                self.root.after(0, lambda: self._on_fob_saved(win, sku))
-
-            threading.Thread(target=worker, daemon=True).start()
+            try:
+                local_store.set_fob(sku, new_fob)
+            except Exception as e:
+                messagebox.showerror(
+                    "Error", f"No se pudo guardar el FOB:\n{e}", parent=win
+                )
+                return
+            self._on_fob_saved(win, sku)
 
         save_btn.configure(command=do_save)
         entry.bind("<Return>", lambda e: do_save())
@@ -1173,12 +1193,6 @@ class VentasApp:
         y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
         win.geometry(f"+{x}+{y}")
         win.grab_set()
-
-    def _fob_save_failed(self, win, save_btn, cancel_btn, entry, msg):
-        save_btn.configure(state="normal", text="Guardar")
-        cancel_btn.configure(state="normal")
-        entry.configure(state="normal")
-        messagebox.showerror("Error", f"No se pudo guardar el FOB:\n{msg}", parent=win)
 
     def _on_fob_saved(self, win, sku: str):
         win.destroy()
@@ -1197,10 +1211,7 @@ class VentasApp:
         if not sku:
             self._flash_status("Esta venta no tiene SKU — no se puede cargar multiplicador")
             return "break"
-        if not ventas_db.loaded():
-            self._flash_status("ventas_db todavía no cargó, esperá un segundo")
-            return "break"
-        if ventas_db.get_fob(sku) is None:
+        if local_store.get_fob(sku) is None:
             self._flash_status(
                 "Cargá primero el precio FOB (Ctrl+Shift+Click)"
             )
@@ -1230,7 +1241,7 @@ class VentasApp:
         ttk.Label(frame, text="Multiplicador (unidades por publicación):").pack(
             anchor="w"
         )
-        actual = ventas_db.get_multiplicador(sku)
+        actual = local_store.get_multiplicador(sku)
         mult_var = tk.StringVar(value=str(actual) if actual else "")
         entry = ttk.Entry(frame, textvariable=mult_var, width=12)
         entry.pack(anchor="w", pady=(2, 12))
@@ -1262,26 +1273,14 @@ class VentasApp:
             if new_mult < 1:
                 self._flash_status("El multiplicador debe ser ≥ 1")
                 return
-
-            save_btn.configure(state="disabled", text="Guardando...")
-            cancel_btn.configure(state="disabled")
-            entry.configure(state="disabled")
-
-            def worker():
-                try:
-                    ventas_db.set_multiplicador(sku, new_mult)
-                except Exception as e:
-                    msg = str(e)
-                    self.root.after(
-                        0,
-                        lambda m=msg: self._mult_save_failed(
-                            win, save_btn, cancel_btn, entry, m
-                        ),
-                    )
-                    return
-                self.root.after(0, lambda: self._on_mult_saved(win, sku))
-
-            threading.Thread(target=worker, daemon=True).start()
+            try:
+                local_store.set_multiplicador(sku, new_mult)
+            except Exception as e:
+                messagebox.showerror(
+                    "Error", f"No se pudo guardar el multiplicador:\n{e}", parent=win
+                )
+                return
+            self._on_mult_saved(win, sku)
 
         save_btn.configure(command=do_save)
         entry.bind("<Return>", lambda e: do_save())
@@ -1293,12 +1292,6 @@ class VentasApp:
         win.geometry(f"+{x}+{y}")
         win.grab_set()
 
-    def _mult_save_failed(self, win, save_btn, cancel_btn, entry, msg):
-        save_btn.configure(state="normal", text="Guardar")
-        cancel_btn.configure(state="normal")
-        entry.configure(state="normal")
-        messagebox.showerror("Error", f"No se pudo guardar el multiplicador:\n{msg}", parent=win)
-
     def _on_mult_saved(self, win, sku: str):
         win.destroy()
         self._flash_status(f"Multiplicador guardado para {sku} ✓")
@@ -1306,7 +1299,7 @@ class VentasApp:
 
     def _open_totales_modal(self):
         totales = self._calcular_totales_seleccionados()
-        selected_total = ventas_db.count_checked()
+        selected_total = local_store.count_checked()
 
         win = tk.Toplevel(self.root)
         win.title("Totales de seleccionadas")
@@ -1325,32 +1318,6 @@ class VentasApp:
         ttk.Label(
             outer, text=header_text, font=("TkDefaultFont", 11, "bold")
         ).pack(anchor="w", pady=(0, 10))
-
-        # Warning de Flex con bonificación: si alguna(s) seleccionada(s) son
-        # Flex con shipping cost 0, MP les suma una bonificación que el API
-        # no expone, así que el "Neto MP" / "Ganancia de Pablo total" están
-        # subestimados para esas ventas.
-        if totales.get("count_flex_bonif", 0) > 0:
-            n = totales["count_flex_bonif"]
-            label_v = "venta es" if n == 1 else "ventas son"
-            tk.Label(
-                outer,
-                text=f"⚡ {n} {label_v} Flex (Héctor ya descontado)",
-                foreground="#d35400",
-                font=("TkDefaultFont", 10, "bold"),
-            ).pack(anchor="w")
-            ttk.Label(
-                outer,
-                text=(
-                    f"Se restó {format_price(PAGO_HECTOR_FLEX)} promedio "
-                    f"por entrega.\n"
-                    "MP suma una bonificación por el envío que el API no\n"
-                    "expone — el real puede ser un poco mayor."
-                ),
-                foreground="#888",
-                font=("TkDefaultFont", 9, "italic"),
-                justify="left",
-            ).pack(anchor="w", pady=(0, 8))
 
         if totales["count_total"] == 0:
             ttk.Label(
@@ -1487,15 +1454,6 @@ class VentasApp:
         x = self.root.winfo_rootx() + (self.root.winfo_width() - win.winfo_width()) // 2
         y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
         win.geometry(f"+{x}+{y}")
-
-    def _cargar_productos_async(self):
-        def worker():
-            try:
-                n = productos_lookup.cargar()
-                self.root.after(0, lambda: self._on_productos_cargados(n, None))
-            except Exception as e:
-                self.root.after(0, lambda: self._on_productos_cargados(0, str(e)))
-        threading.Thread(target=worker, daemon=True).start()
 
     def _cargar_dolar_async(self):
         def worker():
@@ -1696,44 +1654,6 @@ class VentasApp:
         # Refrescar el detalle por si ya hay una fila seleccionada.
         self._on_select()
 
-    def _cargar_ventas_db_async(self):
-        def worker():
-            try:
-                ventas_db.init_db()
-                self.root.after(0, self._on_ventas_db_cargada)
-            except Exception as e:
-                self.root.after(
-                    0, lambda m=str(e): self._flash_status(
-                        f"⚠️ Error cargando ventas_db: {m[:80]}", ms=5000
-                    )
-                )
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_ventas_db_cargada(self):
-        # Re-aplicar marcas a las filas ya cargadas (puede pasar si la API de ML
-        # respondió antes que la carga de Turso).
-        for leaf_id, order_id in self.row_to_order.items():
-            checked = ventas_db.is_checked(order_id)
-            values = list(self.tree.item(leaf_id, "values"))
-            values[0] = CHECKED if checked else UNCHECKED
-            self.tree.item(
-                leaf_id, values=values, tags=self._row_tags(leaf_id, order_id)
-            )
-        for parent in self.tree.get_children(""):
-            self._update_day_check(parent)
-        self._update_header_check()
-        self._update_status()
-        # Refrescar el detalle por si está mostrando un FOB.
-        self._on_select()
-
-    def _on_productos_cargados(self, n: int, error: str | None):
-        if error:
-            self.detail_status_var.set(f"⚠️ Error cargando productos:\n{error}")
-            self.detail_status_lbl.configure(foreground="#c0392b")
-            return
-        # Refrescar el detalle si ya hay una fila seleccionada
-        self._on_select()
-
     def _all_leaves(self) -> list:
         leaves = []
         for parent in self.tree.get_children(""):
@@ -1760,7 +1680,7 @@ class VentasApp:
     def _setup_filter_placeholder(
         self, entry: ttk.Entry, var: tk.StringVar, placeholder: str
     ) -> None:
-        """Placeholder gris que desaparece al hacer focus, igual que gestor-productos."""
+        """Placeholder gris que desaparece al hacer focus."""
         def _on_focus_in(_e):
             if entry.get() == placeholder:
                 entry.delete(0, "end")
@@ -1829,7 +1749,7 @@ class VentasApp:
                 continue
             if solo_con_nota:
                 order_id = self.row_to_order.get(leaf_id)
-                if not order_id or not ventas_db.has_nota(order_id):
+                if not order_id or not local_store.has_nota(order_id):
                     continue
             visible_per_day.setdefault(meta["day_key"], []).append(leaf_id)
 
@@ -1882,28 +1802,17 @@ class VentasApp:
         sin_costo: list[tuple[str, str, str]] = []
         count_total = 0
         count_calc = 0
-        # Conteo de ventas Flex con bonificación de envío (logistic_type
-        # self_service + shipping_cost 0). En esos casos MP suma una
-        # bonificación al seller que el API público no expone, así que el
-        # neto está SUBESTIMADO. Lo mostramos como warning en el modal.
-        count_flex_bonif = 0
         cot = dolar.get()
 
         # Iterar TODAS las leaves cargadas (incluso ocultas por el filtro),
         # así los totales son independientes del filtro visual.
         for leaf_id, order_id in self.row_to_order.items():
-            if not order_id or not ventas_db.is_checked(order_id):
+            if not order_id or not local_store.is_checked(order_id):
                 continue
             info = self.leaf_to_item.get(leaf_id) or {}
             count_total += 1
             bruto += float(info.get("total_amount") or 0)
             neto_all += float(info.get("neto") or 0)
-            if (
-                info.get("shipping_loaded")
-                and info.get("logistic_type") == "self_service"
-                and float(info.get("shipping_cost") or 0) == 0
-            ):
-                count_flex_bonif += 1
 
             sku = info.get("sku") or ""
             title = info.get("title") or ""
@@ -1915,11 +1824,11 @@ class VentasApp:
             if not sku:
                 sin_costo.append(("", title, "sin SKU"))
                 continue
-            fob = ventas_db.get_fob(sku)
+            fob = local_store.get_fob(sku)
             if not fob or fob <= 0:
                 sin_costo.append((sku, title, "sin FOB"))
                 continue
-            mult = ventas_db.get_multiplicador(sku)
+            mult = local_store.get_multiplicador(sku)
             if mult is None:
                 sin_costo.append((sku, title, "sin multiplicador"))
                 continue
@@ -1937,7 +1846,6 @@ class VentasApp:
         return {
             "count_total": count_total,
             "count_calc": count_calc,
-            "count_flex_bonif": count_flex_bonif,
             "bruto": bruto,
             "neto_all": neto_all,
             "neto_calc": neto_calc,
@@ -1953,12 +1861,12 @@ class VentasApp:
             visible = len(self._all_leaves())
             self.status_var.set(
                 f"{visible} de {loaded} cargadas (filtro)  •  "
-                f"{ventas_db.count_checked()} seleccionadas"
+                f"{local_store.count_checked()} seleccionadas"
             )
         else:
             self.status_var.set(
                 f"{loaded} de {self.total} ventas en {days} días  •  "
-                f"{ventas_db.count_checked()} seleccionadas"
+                f"{local_store.count_checked()} seleccionadas"
             )
         self._update_totales_inline()
 
@@ -1977,54 +1885,20 @@ class VentasApp:
             foreground="#1e7a1e" if totales["ganancia"] >= 0 else "#c0392b"
         )
 
-    def _persist_check_async(self, order_id: str, checked: bool):
-        """Escribe el check en Turso en background. Si falla, revierte la cache y la UI."""
-        def worker():
-            try:
-                ventas_db.persist_check(order_id, checked)
-            except Exception as e:
-                self.root.after(
-                    0, lambda m=str(e): self._on_check_failed(order_id, checked, m)
-                )
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _on_check_failed(self, order_id: str, attempted: bool, error: str):
-        # Rollback en cache
-        ventas_db.mark_local(order_id, not attempted)
-        # Re-render todas las filas con ese order_id (puede haber más de una si hay duplicados)
-        for leaf_id, oid in self.row_to_order.items():
-            if oid != order_id:
-                continue
-            values = list(self.tree.item(leaf_id, "values"))
-            values[0] = CHECKED if not attempted else UNCHECKED
-            self.tree.item(
-                leaf_id, values=values, tags=self._row_tags(leaf_id, order_id)
-            )
-            parent = self.tree.parent(leaf_id)
-            if parent:
-                self._update_day_check(parent)
-        self._update_header_check()
-        self._update_status()
-        self._flash_status(f"⚠️ Error guardando check: {error[:80]}", ms=4000)
-
     def _set_leaf_check(self, leaf_id: str, checked: bool):
         order_id = self.row_to_order.get(leaf_id)
         if not order_id:
             return
-        # Update optimista en cache (sync, main thread)
-        ventas_db.mark_local(order_id, checked)
-        # Update visual
+        local_store.set_check(order_id, checked)
         values = list(self.tree.item(leaf_id, "values"))
         values[0] = CHECKED if checked else UNCHECKED
         self.tree.item(leaf_id, values=values, tags=self._row_tags(leaf_id, order_id))
-        # Persist en background
-        self._persist_check_async(order_id, checked)
 
     def _toggle(self, leaf_id: str):
         order_id = self.row_to_order.get(leaf_id)
         if order_id is None:
             return
-        self._set_leaf_check(leaf_id, not ventas_db.is_checked(order_id))
+        self._set_leaf_check(leaf_id, not local_store.is_checked(order_id))
         parent = self.tree.parent(leaf_id)
         if parent:
             self._update_day_check(parent)
@@ -2036,7 +1910,7 @@ class VentasApp:
         if not leaves:
             return
         all_checked = all(
-            ventas_db.is_checked(self.row_to_order.get(l) or "") for l in leaves
+            local_store.is_checked(self.row_to_order.get(l) or "") for l in leaves
         )
         for l in leaves:
             self._set_leaf_check(l, not all_checked)
@@ -2049,7 +1923,7 @@ class VentasApp:
         if not leaves:
             return
         all_checked = all(
-            ventas_db.is_checked(self.row_to_order.get(l) or "") for l in leaves
+            local_store.is_checked(self.row_to_order.get(l) or "") for l in leaves
         )
         for l in leaves:
             self._set_leaf_check(l, not all_checked)
@@ -2063,7 +1937,7 @@ class VentasApp:
         if not leaves:
             return
         all_checked = all(
-            ventas_db.is_checked(self.row_to_order.get(l) or "") for l in leaves
+            local_store.is_checked(self.row_to_order.get(l) or "") for l in leaves
         )
         values = list(self.tree.item(parent_id, "values"))
         values[0] = CHECKED if all_checked else UNCHECKED
@@ -2072,7 +1946,7 @@ class VentasApp:
     def _update_header_check(self):
         leaves = self._all_leaves()
         if leaves and all(
-            ventas_db.is_checked(self.row_to_order.get(l) or "") for l in leaves
+            local_store.is_checked(self.row_to_order.get(l) or "") for l in leaves
         ):
             self.tree.heading("check", text=CHECKED)
         else:
@@ -2080,8 +1954,8 @@ class VentasApp:
 
     def _row_tags(self, row_id: str, order_id: str) -> tuple:
         base = self.row_base.get(row_id, "even")
-        tags: list[str] = ["selected"] if ventas_db.is_checked(order_id) else [base]
-        if ventas_db.has_nota(order_id):
+        tags: list[str] = ["selected"] if local_store.is_checked(order_id) else [base]
+        if local_store.has_nota(order_id):
             tags.append("with_note")
         return tuple(tags)
 
@@ -2094,7 +1968,6 @@ class VentasApp:
         self.context_menu.entryconfig("Copiar título", state=leaf_state)
         self.context_menu.entryconfig("Copiar SKU", state=leaf_state)
         self.context_menu.entryconfig("Copiar ID publicación", state=leaf_state)
-        self.context_menu.entryconfig("Refrescar fila", state=leaf_state)
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.focus_set()
 
@@ -2412,69 +2285,6 @@ class VentasApp:
         with urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
 
-    def _refresh_clicked_row(self):
-        row = self._right_clicked_row
-        if not row or self.tree.parent(row) == "":
-            return
-        # Recargamos también el cache de productos por si el usuario editó
-        # etiquetas en gestor-productos.
-        self._cargar_productos_async()
-        self._refresh_leaf(row)
-
-    def _refresh_leaf(self, leaf_id: str):
-        info = self.leaf_to_item.get(leaf_id)
-        if not info or not info.get("item_id"):
-            return
-        item_id = info["item_id"]
-        variation_id = info.get("variation_id")
-        self._flash_status(f"Refrescando {item_id}...", ms=10000)
-
-        def worker():
-            try:
-                url = f"https://api.mercadolibre.com/items/{item_id}"
-                req = Request(
-                    url,
-                    headers={"Authorization": f"Bearer {self.auth.access_token}"},
-                )
-                with urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-            except HTTPError as e:
-                msg = f"Error refrescando: HTTP {e.code}"
-                self.root.after(0, lambda m=msg: self._flash_status(m))
-                return
-            except Exception as e:
-                msg = f"Error refrescando: {e}"
-                self.root.after(0, lambda m=msg: self._flash_status(m))
-                return
-
-            new_sku = self._extract_sku_from_item(data, variation_id)
-            print(
-                f"\n[REFRESH FILA] item={item_id} variation={variation_id}",
-                flush=True,
-            )
-            print(
-                f"  item.seller_custom_field = {data.get('seller_custom_field')!r}",
-                flush=True,
-            )
-            print(
-                f"  item.seller_sku = {data.get('seller_sku')!r}",
-                flush=True,
-            )
-            attr_sku = next(
-                (
-                    a.get("value_name")
-                    for a in data.get("attributes") or []
-                    if (a.get("id") or "").upper() == "SELLER_SKU"
-                ),
-                None,
-            )
-            print(f"  item.attributes[SELLER_SKU] = {attr_sku!r}", flush=True)
-            print(f"  has variations = {bool(data.get('variations'))}", flush=True)
-            print(f"  → extract returned: {new_sku!r}", flush=True)
-            self.root.after(0, lambda: self._on_leaf_refreshed(leaf_id, new_sku))
-
-        threading.Thread(target=worker, daemon=True).start()
-
     def _extract_sku_from_item(self, item_data: dict, variation_id) -> str:
         has_variations = bool(item_data.get("variations"))
 
@@ -2524,17 +2334,6 @@ class VentasApp:
         if sku:
             return str(sku)
         return ""
-
-    def _on_leaf_refreshed(self, leaf_id: str, new_sku: str):
-        info = self.leaf_to_item.get(leaf_id)
-        if info is not None:
-            info["sku"] = new_sku
-        if leaf_id in self.tree.get_children(self.tree.parent(leaf_id)):
-            values = list(self.tree.item(leaf_id, "values"))
-            values[2] = new_sku
-            self.tree.item(leaf_id, values=values)
-        self._refresh_leaf_meta(leaf_id)
-        self._flash_status(f"SKU actual: {new_sku or '(vacío)'}")
 
     def _copy_clicked_title(self):
         row = self._right_clicked_row
@@ -2620,7 +2419,7 @@ class VentasApp:
             day_key = parent_to_day.get(parent_id, "")
             for leaf_id in self.tree.get_children(parent_id):
                 order_id = self.row_to_order.get(leaf_id)
-                if not order_id or not ventas_db.is_checked(order_id):
+                if not order_id or not local_store.is_checked(order_id):
                     continue
                 values = self.tree.item(leaf_id, "values")
                 _, time_str, sku, qty, title, price_str, subtotal_str = values
@@ -2644,7 +2443,7 @@ class VentasApp:
         return ordered, days, grand_total, count
 
     def _copy_selected_to_clipboard(self):
-        if ventas_db.count_checked() == 0:
+        if local_store.count_checked() == 0:
             self._flash_status("No hay ventas seleccionadas")
             return
         ordered, days, grand_total, total_count = self._collect_selected()
@@ -2670,7 +2469,7 @@ class VentasApp:
         self._flash_status(f"Copiado al portapapeles ✓ ({total_count} ventas)")
 
     def export_excel(self):
-        if ventas_db.count_checked() == 0:
+        if local_store.count_checked() == 0:
             self._flash_status("No hay ventas seleccionadas")
             return
         ordered, days, grand_total, count = self._collect_selected()
@@ -2859,7 +2658,6 @@ class VentasApp:
         self._leaves_meta.clear()
         self._leaf_order_counter = 0
         self.offset = 0
-        self._cargar_productos_async()
         self._fetch_async(append=False)
 
     def load_more(self):
@@ -2922,11 +2720,11 @@ class VentasApp:
             order_id = str(order.get("id", ""))
 
             parent_id = self._get_or_create_day(day_key)
-            checked = ventas_db.is_checked(order_id)
+            checked = local_store.is_checked(order_id)
             mark = CHECKED if checked else UNCHECKED
             base = "odd" if (start_idx + i) % 2 else "even"
             tags_list = ["selected"] if checked else [base]
-            if ventas_db.has_nota(order_id):
+            if local_store.has_nota(order_id):
                 tags_list.append("with_note")
             leaf_id = self.tree.insert(
                 parent_id,
@@ -2951,14 +2749,11 @@ class VentasApp:
             except (TypeError, ValueError):
                 sale_fee_unit = 0.0
             sale_fee_total = sale_fee_unit * quantity
-            # `order.shipping_cost` casi siempre viene null en /orders/search.
-            # El costo real del envío para el seller vive en
-            # /shipments/{id}/costs → senders[0].cost. Lo trae
-            # `_refresh_shipping_costs_batch` en background después de cargar
-            # las órdenes; mientras tanto arrancamos en 0 y `shipping_loaded`
-            # marca si ya llegó la respuesta o no.
+            # Heurístico de shipping: NO hacemos llamadas a /shipments.
+            # Si la order tiene shipment y supera el umbral de envío gratis,
+            # asumimos que el seller paga ~SHIPPING_FREE_RATE del total.
             shipment = order.get("shipping") or {}
-            shipment_id = shipment.get("id")
+            has_shipment = bool(shipment.get("id"))
             taxes = order.get("taxes") or {}
             try:
                 taxes_amount = float(taxes.get("amount") or 0)
@@ -2968,12 +2763,14 @@ class VentasApp:
                 total_amount = float(order.get("total_amount") or line_total)
             except (TypeError, ValueError):
                 total_amount = line_total
+            if has_shipment and total_amount >= SHIPPING_FREE_THRESHOLD:
+                shipping_cost = round(total_amount * SHIPPING_FREE_RATE, 2)
+            else:
+                shipping_cost = 0.0
             # Nota: NO restamos coupon_amount. `total_amount` ya es el precio
             # listado completo; el cupón es un descuento que el marketplace le
-            # devuelve al seller, no un gasto. MP lo refleja como "Cobro por
-            # descuento a tu contraparte" (positivo). Antes lo restábamos y eso
-            # generaba la discrepancia con el "Total a recibir" de MP.
-            neto = total_amount - sale_fee_total - taxes_amount
+            # devuelve al seller, no un gasto.
+            neto = total_amount - sale_fee_total - shipping_cost - taxes_amount
 
             self.leaf_to_item[leaf_id] = {
                 "item_id": item.get("id", ""),
@@ -2987,9 +2784,7 @@ class VentasApp:
                 "payment_method": first_payment.get("payment_method_id"),
                 "total_amount": total_amount,
                 "sale_fee": sale_fee_total,
-                "shipment_id": shipment_id,
-                "shipping_cost": 0.0,
-                "shipping_loaded": False,
+                "shipping_cost": shipping_cost,
                 "taxes_amount": taxes_amount,
                 "neto": neto,
             }
@@ -3008,202 +2803,6 @@ class VentasApp:
         # Si hay filtro activo, aplicarlo a las filas nuevas también.
         if self._filter_active:
             self._refresh_tree_filter()
-
-        # Disparar refresco de SKUs en background: el endpoint /orders devuelve
-        # snapshot histórico del item, así que el SKU puede estar desactualizado.
-        new_leaf_ids = list(self.row_to_order.keys())[start_idx:]
-        if new_leaf_ids:
-            threading.Thread(
-                target=self._refresh_skus_batch,
-                args=(new_leaf_ids,),
-                daemon=True,
-            ).start()
-            # Mismo patrón para los shipping costs reales (vienen de
-            # /shipments/{id}/costs, no del listado de orders).
-            threading.Thread(
-                target=self._refresh_shipping_costs_batch,
-                args=(new_leaf_ids,),
-                daemon=True,
-            ).start()
-
-    def _refresh_skus_batch(self, leaf_ids: list):
-        # Agrupar leaves por item_id (varias órdenes pueden compartir item).
-        item_to_leaves: dict = {}
-        for lid in leaf_ids:
-            info = self.leaf_to_item.get(lid) or {}
-            iid = info.get("item_id")
-            if iid:
-                item_to_leaves.setdefault(iid, []).append(lid)
-
-        if not item_to_leaves:
-            return
-
-        unique_ids = list(item_to_leaves.keys())
-        BATCH = 20
-        item_data: dict = {}
-        for i in range(0, len(unique_ids), BATCH):
-            chunk = unique_ids[i : i + BATCH]
-            url = (
-                "https://api.mercadolibre.com/items?"
-                + urlencode({
-                    "ids": ",".join(chunk),
-                    "attributes": "id,seller_sku,seller_custom_field,attributes,variations",
-                })
-            )
-            try:
-                req = Request(
-                    url,
-                    headers={"Authorization": f"Bearer {self.auth.access_token}"},
-                )
-                with urlopen(req, timeout=30) as resp:
-                    payload = json.loads(resp.read().decode("utf-8"))
-            except Exception:
-                continue
-            # multiget devuelve [{"code":200,"body":{...}}, ...]
-            for entry in payload or []:
-                if entry.get("code") != 200:
-                    continue
-                body = entry.get("body") or {}
-                iid = body.get("id")
-                if iid:
-                    item_data[iid] = body
-
-        # Calcular SKUs nuevos por leaf y aplicarlos en el main thread.
-        updates: list = []
-        for iid, leaves in item_to_leaves.items():
-            body = item_data.get(iid)
-            if not body:
-                continue
-            for lid in leaves:
-                info = self.leaf_to_item.get(lid) or {}
-                new_sku = self._extract_sku_from_item(body, info.get("variation_id"))
-                if new_sku and new_sku != info.get("sku"):
-                    updates.append((lid, new_sku))
-
-        if updates:
-            self.root.after(0, lambda: self._apply_sku_updates(updates))
-
-    def _apply_sku_updates(self, updates: list):
-        for lid, new_sku in updates:
-            info = self.leaf_to_item.get(lid)
-            if info is not None:
-                info["sku"] = new_sku
-            try:
-                parent = self.tree.parent(lid)
-            except tk.TclError:
-                continue
-            if lid in self.tree.get_children(parent):
-                values = list(self.tree.item(lid, "values"))
-                values[2] = new_sku
-                self.tree.item(lid, values=values)
-            self._refresh_leaf_meta(lid)
-        self._flash_status(f"SKUs sincronizados ({len(updates)})")
-
-    def _refresh_shipping_costs_batch(self, leaf_ids: list):
-        """Trae el costo real del envío + el logistic_type del shipment para
-        cada leaf y actualiza el neto en el main thread.
-
-        Hacemos DOS requests por shipment_id único:
-          - /shipments/{id}/costs → senders[0].cost  (costo real al seller)
-          - /shipments/{id}        → logistic_type   (para detectar Flex)
-
-        Necesitamos los dos: el cost va al cálculo del neto, el logistic_type
-        sirve para mostrar el chip "⚡ Flex con bonificación" en el panel
-        cuando MP suma una bonificación al seller que el API público no
-        expone (ver _render_payment).
-
-        Cache de proceso por shipment_id para no repetir nunca el mismo par
-        de requests.
-        """
-        from concurrent.futures import ThreadPoolExecutor
-
-        # leaf_id → shipment_id (solo los que faltan resolver)
-        pendientes: list[tuple[str, int]] = []
-        for lid in leaf_ids:
-            info = self.leaf_to_item.get(lid) or {}
-            if info.get("shipping_loaded"):
-                continue
-            sid = info.get("shipment_id")
-            if not sid:
-                # Sin envío → loaded con cost 0, marcamos para no reintentar.
-                self.root.after(0, self._on_shipping_cost_loaded, lid, 0.0, None)
-                continue
-            cached = self._shipping_cost_cache.get(sid)
-            if cached is not None:
-                cost, ltype = cached
-                self.root.after(0, self._on_shipping_cost_loaded, lid, cost, ltype)
-                continue
-            pendientes.append((lid, sid))
-
-        if not pendientes:
-            return
-
-        def fetch_one(args):
-            lid, sid = args
-            cost = 0.0
-            logistic_type = None
-            headers = {"Authorization": f"Bearer {self.auth.access_token}"}
-            try:
-                req = Request(
-                    f"https://api.mercadolibre.com/shipments/{sid}/costs",
-                    headers=headers,
-                )
-                with urlopen(req, timeout=15) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                senders = data.get("senders") or []
-                cost = float((senders[0] or {}).get("cost") or 0) if senders else 0.0
-            except Exception:
-                pass
-            try:
-                req = Request(
-                    f"https://api.mercadolibre.com/shipments/{sid}",
-                    headers=headers,
-                )
-                with urlopen(req, timeout=15) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                logistic_type = data.get("logistic_type")
-            except Exception:
-                pass
-            self._shipping_cost_cache[sid] = (cost, logistic_type)
-            self.root.after(
-                0, self._on_shipping_cost_loaded, lid, cost, logistic_type
-            )
-
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            list(ex.map(fetch_one, pendientes))
-
-    def _on_shipping_cost_loaded(self, leaf_id: str, cost: float, logistic_type):
-        """Callback main-thread: aplica el shipping cost + logistic_type a
-        una venta y recalcula el neto. Refresca panel de detalle si la fila
-        está seleccionada y actualiza el mini totalizador.
-
-        Para envíos Flex (self_service con shipping_cost == 0) además resta
-        PAGO_HECTOR_FLEX, que es lo que Pablo le paga afuera al delivery
-        para hacer la entrega — un costo real que ML/MP no expone en ningún
-        endpoint y que la app modela como constante.
-        """
-        info = self.leaf_to_item.get(leaf_id)
-        if info is None:
-            return
-        info["shipping_cost"] = cost
-        info["shipping_loaded"] = True
-        info["logistic_type"] = logistic_type
-        is_flex = logistic_type == "self_service" and cost == 0
-        pago_hector = PAGO_HECTOR_FLEX if is_flex else 0.0
-        info["pago_hector"] = pago_hector
-        info["neto"] = (
-            float(info.get("total_amount") or 0)
-            - float(info.get("sale_fee") or 0)
-            - cost
-            - float(info.get("taxes_amount") or 0)
-            - pago_hector
-        )
-        # Si la fila afectada es la seleccionada, redibujamos el panel.
-        sel = self.tree.selection()
-        if sel and sel[0] == leaf_id:
-            self._on_select()
-        # El mini totalizador iteraba el neto viejo; refrescarlo.
-        self._update_totales_inline()
 
     def _get_or_create_day(self, day_key: str) -> str:
         if day_key in self.day_nodes:

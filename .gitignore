@@ -3,3 +3,5 @@ __pycache__/
 *.xlsx
 .venv/
 venv/
+.env
+data.json

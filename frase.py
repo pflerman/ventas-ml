@@ -8,9 +8,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Reusamos el .env del gestor que ya tiene la ANTHROPIC_API_KEY.
-_GESTOR_ENV = Path.home() / "Proyectos" / "gestor-productos" / ".env"
-load_dotenv(_GESTOR_ENV)
+# .env local del proyecto con ANTHROPIC_API_KEY=...
+# Si no existe, el SDK de Anthropic igual lee la variable de entorno si
+# está exportada en la sesión.
+_LOCAL_ENV = Path(__file__).parent / ".env"
+if _LOCAL_ENV.exists():
+    load_dotenv(_LOCAL_ENV)
 
 _frase: str | None = None
 _loaded = False
