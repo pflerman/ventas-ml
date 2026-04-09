@@ -87,7 +87,32 @@
     "2000015906400856": 6500.0,
     "2000015907553300": 6500.0
   },
-  "consolidados": [],
+  "consolidados": [
+    {
+      "id": "5a308ffdd6",
+      "fecha_creacion": "15/11/96",
+      "fecha_desde": "14/11/55",
+      "fecha_hasta": "14/16/98",
+      "fecha_pago": "14/11/88",
+      "monto_deuda": 1500000.0,
+      "credito": 300000.0,
+      "activo": true,
+      "facturado": false,
+      "nota": "pepe"
+    },
+    {
+      "id": "a0ada1c198",
+      "fecha_creacion": "777",
+      "fecha_desde": "7",
+      "fecha_hasta": "7",
+      "fecha_pago": "7",
+      "monto_deuda": 7.0,
+      "credito": 7.0,
+      "activo": true,
+      "facturado": true,
+      "nota": "7"
+    }
+  ],
   "liquidacion_links": {
     "2026-05-07": [
       "https://www.mercadopago.com.ar/activities/detail/purchase_v3-5b9590a08658a52d0a31c607ccad826fee338575?from=afs-embedding-on"
