@@ -8,7 +8,8 @@ import threading
 import tkinter as tk
 import unicodedata
 import webbrowser
-from datetime import datetime
+import calendar as _calendar
+from datetime import datetime, date
 from pathlib import Path
 from tkinter import filedialog, font as tkfont
 from tkinter import messagebox, ttk
@@ -199,6 +200,10 @@ class VentasApp:
         consolidados_tab = ttk.Frame(self.notebook, padding=4)
         self.notebook.add(consolidados_tab, text="Consolidados")
         self._consolidados_tab = consolidados_tab
+
+        liquidacion_tab = ttk.Frame(self.notebook, padding=4)
+        self.notebook.add(liquidacion_tab, text="Liquidación")
+        self._liquidacion_tab = liquidacion_tab
 
         paned = ttk.PanedWindow(container, orient="horizontal")
         paned.pack(fill="both", expand=True)
@@ -449,6 +454,9 @@ class VentasApp:
 
         # Pestaña Consolidados (independiente de las ventas).
         self._build_consolidados_tab()
+
+        # Pestaña Liquidación (calendario + links MP por día).
+        self._build_liquidacion_tab()
 
     def _build_detail_panel(self):
         ttk.Label(
@@ -1049,6 +1057,422 @@ class VentasApp:
         y = self.root.winfo_rooty() + (self.root.winfo_height() - win.winfo_height()) // 3
         win.geometry(f"+{x}+{y}")
         win.grab_set()
+
+    # ──────────────────── Pestaña Liquidación ────────────────────
+    # Calendario mensual + panel con links de Mercado Pago por día.
+    # Todo manual: el usuario navega al mes, clickea un día, pega un link
+    # y se persiste. Cuando vuelve a abrir la app sobre ese día, los links
+    # aparecen listos para abrir/copiar.
+
+    LIQ_DIAS_SEMANA = ["Lu", "Ma", "Mi", "Ju", "Vi", "Sá", "Do"]
+    LIQ_MESES = [
+        "", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+        "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre",
+    ]
+    LIQ_DIAS_NOMBRE = [
+        "Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo",
+    ]
+
+    def _build_liquidacion_tab(self):
+        tab = self._liquidacion_tab
+
+        today = date.today()
+        self._liq_year = today.year
+        self._liq_month = today.month
+        self._liq_selected_date = today.isoformat()
+
+        # ─── Banner "HOY" si tiene links ───
+        # Reminder visual permanente: incluso si navegás a otro mes, este
+        # banner te dice si hoy tenés links pendientes. Lo packeo PRIMERO
+        # para que quede arriba de todo, y _liq_refresh_today_banner lo
+        # esconde con pack_forget si hoy no hay links.
+        self._liq_today_banner = tk.Frame(tab, background="#fff8c2")
+        self._liq_today_banner_lbl = tk.Label(
+            self._liq_today_banner,
+            text="",
+            background="#fff8c2",
+            foreground="#8a6d00",
+            font=("TkDefaultFont", 11, "bold"),
+            padx=10,
+            pady=6,
+        )
+        self._liq_today_banner_lbl.pack(side="left")
+        tk.Button(
+            self._liq_today_banner,
+            text="Ver hoy →",
+            command=self._liq_go_today,
+            background="#fff8c2",
+            relief="flat",
+            cursor="hand2",
+            font=("TkDefaultFont", 10, "bold"),
+            foreground="#1f4e9d",
+            borderwidth=0,
+        ).pack(side="right", padx=(0, 10))
+        # Pack inicial: visible. _liq_refresh_today_banner lo esconde si hace falta.
+        self._liq_today_banner.pack(fill="x", pady=(0, 8))
+
+        # ─── Top bar: nav del mes + botón hoy ───
+        topbar = ttk.Frame(tab)
+        topbar.pack(fill="x", pady=(0, 8))
+
+        ttk.Button(
+            topbar, text="◀", command=self._liq_prev_month, width=3
+        ).pack(side="left")
+
+        self._liq_month_label_var = tk.StringVar()
+        tk.Label(
+            topbar,
+            textvariable=self._liq_month_label_var,
+            font=("TkDefaultFont", 13, "bold"),
+            foreground="#1a3a5c",
+        ).pack(side="left", padx=(8, 8))
+
+        ttk.Button(
+            topbar, text="▶", command=self._liq_next_month, width=3
+        ).pack(side="left")
+
+        ttk.Button(
+            topbar, text="📅 Hoy", command=self._liq_go_today
+        ).pack(side="left", padx=(16, 0))
+
+        # ─── Body split: calendario | panel de links ───
+        body = ttk.PanedWindow(tab, orient="horizontal")
+        body.pack(fill="both", expand=True)
+
+        # Lado izquierdo: header de días + grid de días
+        left = ttk.Frame(body)
+        body.add(left, weight=2)
+
+        dow_frame = ttk.Frame(left)
+        dow_frame.pack(fill="x")
+        for i, dow in enumerate(self.LIQ_DIAS_SEMANA):
+            tk.Label(
+                dow_frame,
+                text=dow,
+                font=("TkDefaultFont", 10, "bold"),
+                foreground="#666",
+                anchor="center",
+            ).grid(row=0, column=i, sticky="nsew", padx=1, pady=(0, 4))
+        for i in range(7):
+            dow_frame.grid_columnconfigure(i, weight=1, uniform="liq_dow")
+
+        self._liq_grid = ttk.Frame(left)
+        self._liq_grid.pack(fill="both", expand=True)
+
+        # Lado derecho: panel con links del día seleccionado
+        right_outer = ttk.Frame(body)
+        body.add(right_outer, weight=3)
+
+        # Panel scrolleable
+        self._liq_right_canvas = tk.Canvas(
+            right_outer, highlightthickness=0, borderwidth=0
+        )
+        liq_vsb = ttk.Scrollbar(
+            right_outer, orient="vertical", command=self._liq_right_canvas.yview
+        )
+        self._liq_right_canvas.configure(yscrollcommand=liq_vsb.set)
+        liq_vsb.pack(side="right", fill="y")
+        self._liq_right_canvas.pack(side="left", fill="both", expand=True)
+
+        self._liq_right_frame = ttk.Frame(self._liq_right_canvas, padding=12)
+        self._liq_right_window = self._liq_right_canvas.create_window(
+            (0, 0), window=self._liq_right_frame, anchor="nw"
+        )
+        self._liq_right_frame.bind(
+            "<Configure>",
+            lambda e: self._liq_right_canvas.configure(
+                scrollregion=self._liq_right_canvas.bbox("all")
+            ),
+        )
+        self._liq_right_canvas.bind(
+            "<Configure>",
+            lambda e: self._liq_right_canvas.itemconfig(
+                self._liq_right_window, width=e.width
+            ),
+        )
+
+        # Wheel scroll sobre el panel derecho
+        def _on_wheel(event):
+            if event.num == 4 or getattr(event, "delta", 0) > 0:
+                self._liq_right_canvas.yview_scroll(-3, "units")
+            else:
+                self._liq_right_canvas.yview_scroll(3, "units")
+
+        def _bind_wheel(_e):
+            self._liq_right_canvas.bind_all("<MouseWheel>", _on_wheel)
+            self._liq_right_canvas.bind_all("<Button-4>", _on_wheel)
+            self._liq_right_canvas.bind_all("<Button-5>", _on_wheel)
+
+        def _unbind_wheel(_e):
+            self._liq_right_canvas.unbind_all("<MouseWheel>")
+            self._liq_right_canvas.unbind_all("<Button-4>")
+            self._liq_right_canvas.unbind_all("<Button-5>")
+
+        self._liq_right_canvas.bind("<Enter>", _bind_wheel)
+        self._liq_right_canvas.bind("<Leave>", _unbind_wheel)
+
+        self._liq_refresh_all()
+
+    def _liq_refresh_all(self):
+        self._liq_render_month_label()
+        self._liq_refresh_today_banner()
+        self._liq_render_calendar()
+        self._liq_render_right_panel()
+
+    def _liq_render_month_label(self):
+        self._liq_month_label_var.set(
+            f"{self.LIQ_MESES[self._liq_month]} {self._liq_year}"
+        )
+
+    def _liq_refresh_today_banner(self):
+        today_iso = date.today().isoformat()
+        n = local_store.count_links_dia(today_iso)
+        if n > 0:
+            self._liq_today_banner_lbl.config(
+                text=f"🔔 Hoy ({today_iso}) tenés {n} link{'s' if n != 1 else ''} de liquidación"
+            )
+            if not self._liq_today_banner.winfo_ismapped():
+                # Reusar pack original (arriba de todo, side default = top).
+                self._liq_today_banner.pack(
+                    fill="x", pady=(0, 8), side="top", before=self._liq_today_banner.master.winfo_children()[1]
+                )
+        else:
+            if self._liq_today_banner.winfo_ismapped():
+                self._liq_today_banner.pack_forget()
+
+    def _liq_render_calendar(self):
+        for w in self._liq_grid.winfo_children():
+            w.destroy()
+
+        cal = _calendar.Calendar(firstweekday=0)  # 0 = lunes
+        weeks = cal.monthdayscalendar(self._liq_year, self._liq_month)
+        today_iso = date.today().isoformat()
+        dias_con = local_store.dias_con_links()
+
+        for row, week in enumerate(weeks):
+            for col, day in enumerate(week):
+                if day == 0:
+                    # Celda vacía (días del mes anterior/siguiente).
+                    tk.Label(
+                        self._liq_grid, text="", background="#f8f8f8"
+                    ).grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
+                    continue
+
+                fecha = f"{self._liq_year}-{self._liq_month:02d}-{day:02d}"
+                is_today = (fecha == today_iso)
+                is_selected = (fecha == self._liq_selected_date)
+                has_links = fecha in dias_con
+                count = local_store.count_links_dia(fecha) if has_links else 0
+
+                # Estilo en cascada: seleccionado pisa hoy pisa con-links pisa default.
+                if is_selected:
+                    bg = "#7d3c98"
+                    fg = "white"
+                    border = 2
+                elif is_today:
+                    bg = "#fff8c2"
+                    fg = "#8a6d00"
+                    border = 2
+                elif has_links:
+                    bg = "#d4f4ef"  # teal claro
+                    fg = "#117a65"
+                    border = 1
+                else:
+                    bg = "#ffffff"
+                    fg = "#000"
+                    border = 1
+
+                txt = str(day)
+                if count > 0:
+                    txt = f"{day}\n● {count}"
+
+                btn = tk.Button(
+                    self._liq_grid,
+                    text=txt,
+                    background=bg,
+                    foreground=fg,
+                    activebackground=bg,
+                    relief="solid",
+                    borderwidth=border,
+                    font=("TkDefaultFont", 10, "bold"),
+                    command=lambda d=fecha: self._liq_select_day(d),
+                    cursor="hand2",
+                    height=2,
+                )
+                btn.grid(row=row, column=col, padx=1, pady=1, sticky="nsew")
+
+        for col in range(7):
+            self._liq_grid.grid_columnconfigure(col, weight=1, uniform="liq_col")
+        for row in range(len(weeks)):
+            self._liq_grid.grid_rowconfigure(row, weight=1, uniform="liq_row")
+
+    def _liq_render_right_panel(self):
+        for w in self._liq_right_frame.winfo_children():
+            w.destroy()
+
+        fecha = self._liq_selected_date
+        try:
+            dt = datetime.strptime(fecha, "%Y-%m-%d")
+            header_text = (
+                f"{self.LIQ_DIAS_NOMBRE[dt.weekday()]}, "
+                f"{dt.day} de {self.LIQ_MESES[dt.month]} de {dt.year}"
+            )
+        except Exception:
+            header_text = fecha
+
+        tk.Label(
+            self._liq_right_frame,
+            text=header_text,
+            font=("TkDefaultFont", 13, "bold"),
+            foreground="#1a3a5c",
+        ).pack(anchor="w", pady=(0, 4))
+        tk.Label(
+            self._liq_right_frame,
+            text=fecha,
+            foreground="#888",
+            font=("TkDefaultFont", 9, "italic"),
+        ).pack(anchor="w", pady=(0, 12))
+
+        # ─── Lista de links del día ───
+        links = local_store.get_links_dia(fecha)
+        if not links:
+            ttk.Label(
+                self._liq_right_frame,
+                text="(no hay links para este día)",
+                foreground="#888",
+                font=("TkDefaultFont", 10, "italic"),
+            ).pack(anchor="w", pady=(0, 12))
+        else:
+            ttk.Label(
+                self._liq_right_frame,
+                text=f"Links de liquidación ({len(links)}):",
+                font=("TkDefaultFont", 10, "bold"),
+            ).pack(anchor="w", pady=(0, 6))
+
+            for idx, link in enumerate(links):
+                row = ttk.Frame(self._liq_right_frame)
+                row.pack(fill="x", pady=2)
+
+                tk.Label(
+                    row,
+                    text=f"{idx + 1}.",
+                    width=3,
+                    anchor="ne",
+                    foreground="#666",
+                ).pack(side="left", padx=(0, 4))
+
+                # Botón ✕ a la derecha
+                tk.Button(
+                    row,
+                    text="✕",
+                    command=lambda i=idx: self._liq_remove_link(i),
+                    relief="flat",
+                    foreground="#c0392b",
+                    cursor="hand2",
+                    borderwidth=0,
+                    font=("TkDefaultFont", 10, "bold"),
+                ).pack(side="right")
+
+                # Botón abrir
+                tk.Button(
+                    row,
+                    text="🔗 Abrir",
+                    command=lambda u=link: self._open_url(u),
+                    cursor="hand2",
+                    relief="flat",
+                    foreground="#1f4e9d",
+                    borderwidth=0,
+                    font=("TkDefaultFont", 9, "bold"),
+                ).pack(side="right", padx=(0, 4))
+
+                # Texto del link (clickeable también, abre)
+                lbl = tk.Label(
+                    row,
+                    text=link,
+                    foreground="#1f4e9d",
+                    cursor="hand2",
+                    anchor="w",
+                    wraplength=320,
+                    justify="left",
+                )
+                lbl.pack(side="left", fill="x", expand=True)
+                lbl.bind("<Button-1>", lambda _e, u=link: self._open_url(u))
+
+        # ─── Agregar link nuevo ───
+        ttk.Separator(
+            self._liq_right_frame, orient="horizontal"
+        ).pack(fill="x", pady=(12, 8))
+
+        ttk.Label(
+            self._liq_right_frame,
+            text="Pegá un link nuevo:",
+            font=("TkDefaultFont", 10, "bold"),
+        ).pack(anchor="w")
+
+        self._liq_new_link_var = tk.StringVar()
+        entry = ttk.Entry(
+            self._liq_right_frame,
+            textvariable=self._liq_new_link_var,
+        )
+        entry.pack(fill="x", pady=(2, 6))
+
+        ttk.Button(
+            self._liq_right_frame,
+            text="+ Agregar link",
+            command=self._liq_add_link,
+        ).pack(anchor="w")
+
+        entry.bind("<Return>", lambda _e: self._liq_add_link())
+        entry.bind("<KP_Enter>", lambda _e: self._liq_add_link())
+
+    def _liq_select_day(self, fecha: str):
+        self._liq_selected_date = fecha
+        self._liq_render_calendar()
+        self._liq_render_right_panel()
+
+    def _liq_prev_month(self):
+        if self._liq_month == 1:
+            self._liq_month = 12
+            self._liq_year -= 1
+        else:
+            self._liq_month -= 1
+        self._liq_render_month_label()
+        self._liq_render_calendar()
+
+    def _liq_next_month(self):
+        if self._liq_month == 12:
+            self._liq_month = 1
+            self._liq_year += 1
+        else:
+            self._liq_month += 1
+        self._liq_render_month_label()
+        self._liq_render_calendar()
+
+    def _liq_go_today(self):
+        today = date.today()
+        self._liq_year = today.year
+        self._liq_month = today.month
+        self._liq_selected_date = today.isoformat()
+        self._liq_refresh_all()
+
+    def _liq_add_link(self):
+        link = (self._liq_new_link_var.get() or "").strip()
+        if not link:
+            self._flash_status("Pegá un link primero")
+            return
+        local_store.add_link_dia(self._liq_selected_date, link)
+        self._liq_new_link_var.set("")
+        self._liq_refresh_today_banner()
+        self._liq_render_calendar()
+        self._liq_render_right_panel()
+        self._flash_status("Link agregado ✓")
+
+    def _liq_remove_link(self, idx: int):
+        local_store.remove_link_dia(self._liq_selected_date, idx)
+        self._liq_refresh_today_banner()
+        self._liq_render_calendar()
+        self._liq_render_right_panel()
+        self._flash_status("Link borrado")
 
     def _on_select(self, _event=None):
         sel = self.tree.selection()

@@ -13,7 +13,8 @@ Estructura del JSON:
     "etiquetas_por_sku":  {"SKU": ["ordenador", ...]},   # asignaciones
     "neto_manual":        {"order_id": 12345.67},        # neto MP cargado a mano
     "shipping_manual":    {"order_id": 6500.00},         # costo Flex que paga el seller
-    "consolidados":       [{"id": "...", "fecha_creacion": "2026-04-09", ...}]
+    "consolidados":       [{"id": "...", "fecha_creacion": "2026-04-09", ...}],
+    "liquidacion_links":  {"2026-05-07": ["https://...", "https://..."]}  # links MP por día
 }
 
 Patrón de uso:
@@ -37,6 +38,7 @@ _data: dict = {
     "neto_manual": {},
     "shipping_manual": {},
     "consolidados": [],
+    "liquidacion_links": {},
 }
 _checks_set: set[str] = set()
 _loaded = False
@@ -457,3 +459,41 @@ def get_consolidado(cid: str) -> dict | None:
         if c.get("id") == cid:
             return dict(c)
     return None
+
+
+# ────────────────────── Liquidación: links MP por día ──────────────────────
+# Diccionario {fecha_iso: [link1, link2, ...]}. fecha_iso es "YYYY-MM-DD".
+# Manual: el usuario pega un link en el día que quiere y se persiste.
+
+def get_links_dia(fecha: str) -> list[str]:
+    if not fecha:
+        return []
+    return list(_data.get("liquidacion_links", {}).get(fecha, []))
+
+
+def add_link_dia(fecha: str, link: str) -> None:
+    if not fecha or not link:
+        return
+    d = _data.setdefault("liquidacion_links", {})
+    d.setdefault(fecha, []).append(link)
+    _save()
+
+
+def remove_link_dia(fecha: str, idx: int) -> None:
+    d = _data.get("liquidacion_links", {})
+    links = d.get(fecha)
+    if not links or idx < 0 or idx >= len(links):
+        return
+    links.pop(idx)
+    if not links:
+        d.pop(fecha, None)
+    _save()
+
+
+def dias_con_links() -> set[str]:
+    """Devuelve el set de fechas (ISO) que tienen al menos un link."""
+    return set(_data.get("liquidacion_links", {}).keys())
+
+
+def count_links_dia(fecha: str) -> int:
+    return len(_data.get("liquidacion_links", {}).get(fecha, []))

@@ -21,6 +21,10 @@
     "GP-YKAGK1AS": {
       "precio": 0.93,
       "mult": 6
+    },
+    "GP-0QH8R3YH": {
+      "precio": 0.29,
+      "mult": 12
     }
   },
   "etiquetas_catalogo": [
@@ -33,7 +37,10 @@
     "Pack 5",
     "Blanco",
     "Una Unidad",
-    "Acrílico Común"
+    "Acrílico Común",
+    "Pack 12",
+    "Rack",
+    "Rosa"
   ],
   "etiquetas_por_sku": {
     "PERCHA-MAGICA-3": [
@@ -62,78 +69,28 @@
       "Una Unidad",
       "Acrílico Común",
       "Blanco"
+    ],
+    "GP-0QH8R3YH": [
+      "Pack 12",
+      "Rack",
+      "Rosa"
     ]
   },
   "neto_manual": {
     "2000015906400856": 18813.56,
     "2000015906070442": 27882.65,
     "2000015907553300": 26770.5,
-    "2000015908762376": 77753.18
+    "2000015908762376": 77753.18,
+    "2000015912189958": 96428.87
   },
   "shipping_manual": {
     "2000015906400856": 6500.0,
     "2000015907553300": 6500.0
   },
-  "consolidados": [
-    {
-      "id": "10a4fd5668",
-      "fecha_creacion": "55/22/55",
-      "fecha_desde": "55/22/55",
-      "fecha_hasta": "55/22/55",
-      "fecha_pago": "55/22/55",
-      "monto_deuda": 514.0,
-      "credito": 22.0,
-      "activo": true,
-      "facturado": false,
-      "nota": "22"
-    },
-    {
-      "id": "bb968fb0e8",
-      "fecha_creacion": "48",
-      "fecha_desde": "654",
-      "fecha_hasta": "654",
-      "fecha_pago": "654",
-      "monto_deuda": 645.0,
-      "credito": 654.0,
-      "activo": true,
-      "facturado": false,
-      "nota": "654"
-    },
-    {
-      "id": "94ffd74c5f",
-      "fecha_creacion": "54",
-      "fecha_desde": "54",
-      "fecha_hasta": "854",
-      "fecha_pago": "854",
-      "monto_deuda": 54.0,
-      "credito": 54.0,
-      "activo": true,
-      "facturado": false,
-      "nota": "54"
-    },
-    {
-      "id": "2ea59d7388",
-      "fecha_creacion": "541",
-      "fecha_desde": "4",
-      "fecha_hasta": "451",
-      "fecha_pago": "541",
-      "monto_deuda": 54.0,
-      "credito": 54.0,
-      "activo": true,
-      "facturado": false,
-      "nota": "54"
-    },
-    {
-      "id": "bd31bc82c8",
-      "fecha_creacion": "pete",
-      "fecha_desde": "654",
-      "fecha_hasta": "45",
-      "fecha_pago": "4",
-      "monto_deuda": 45.0,
-      "credito": 54.0,
-      "activo": true,
-      "facturado": false,
-      "nota": "5"
-    }
-  ]
+  "consolidados": [],
+  "liquidacion_links": {
+    "2026-05-07": [
+      "https://www.mercadopago.com.ar/activities/detail/purchase_v3-5b9590a08658a52d0a31c607ccad826fee338575?from=afs-embedding-on"
+    ]
+  }
 }
