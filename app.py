@@ -820,13 +820,17 @@ class VentasApp:
         row = self.tree.identify_row(event.y)
         if not row:
             return
-        order_id = self.row_to_order.get(row)
-        if not order_id:
+        # Preferimos buscar por payment_id (el ID nativo de MP). El order_id
+        # de ML a veces lo matchea el search de MP y a veces no — depende de
+        # cómo MP indexó la relación. payment_id siempre anda.
+        # Fallback al order_id si por alguna razón no tenemos payment_id.
+        info = self.leaf_to_item.get(row) or {}
+        query_id = info.get("payment_id") or self.row_to_order.get(row)
+        if not query_id:
             return
-        # MP busca por order_id de ML y muestra el cobro asociado.
         # Usamos /activities?q=ID porque /activities/detail/{id} requiere un hash
         # purchase_v3-{...} impredecible que solo conoce el frontend de MP.
-        url = f"https://www.mercadopago.com.ar/activities?q={order_id}"
+        url = f"https://www.mercadopago.com.ar/activities?q={query_id}"
         self._open_url(url)
         return "break"
 
