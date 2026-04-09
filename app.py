@@ -327,12 +327,9 @@ class VentasApp:
         self.tree.bind("<Button-1>", self._on_click)
         self.tree.bind("<Button-3>", self._on_right_click)
         self.tree.bind("<Double-Button-1>", self._on_double_click)
-        self.tree.bind("<Control-Button-1>", self._on_ctrl_click)
-        self.tree.bind("<Shift-Button-1>", self._on_shift_click)
+        self.tree.bind("<Control-Button-1>", self._on_ctrl_click_fob)
+        self.tree.bind("<Alt-Button-1>", self._on_alt_click_mult)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
-        self.tree.bind("<Alt-Button-1>", self._on_alt_click)
-        self.tree.bind("<Control-Shift-Button-1>", self._on_ctrl_shift_click)
-        self.tree.bind("<Control-Shift-Alt-Button-1>", self._on_ctrl_shift_alt_click)
 
         self._modifiers_active: set[str] = set()  # subset of {"ctrl", "shift", "alt"}
         self._status_before_hint = ""
@@ -340,19 +337,22 @@ class VentasApp:
         self.root.bind("<KeyPress-Control_R>", lambda e: self._modifier_pressed("ctrl"))
         self.root.bind("<KeyRelease-Control_L>", lambda e: self._modifier_released("ctrl"))
         self.root.bind("<KeyRelease-Control_R>", lambda e: self._modifier_released("ctrl"))
-        self.root.bind("<KeyPress-Shift_L>", lambda e: self._modifier_pressed("shift"))
-        self.root.bind("<KeyPress-Shift_R>", lambda e: self._modifier_pressed("shift"))
-        self.root.bind("<KeyRelease-Shift_L>", lambda e: self._modifier_released("shift"))
-        self.root.bind("<KeyRelease-Shift_R>", lambda e: self._modifier_released("shift"))
         self.root.bind("<KeyPress-Alt_L>", lambda e: self._modifier_pressed("alt"))
         self.root.bind("<KeyPress-Alt_R>", lambda e: self._modifier_pressed("alt"))
         self.root.bind("<KeyRelease-Alt_L>", lambda e: self._modifier_released("alt"))
         self.root.bind("<KeyRelease-Alt_R>", lambda e: self._modifier_released("alt"))
 
-        # F1 sobre la fila seleccionada → editor de la publicación en ML.
-        # ML redirige /publicaciones/{item_id}/modificar a la URL larga con
-        # el token de sesión, así que usamos la forma corta y estable.
-        self.root.bind("<F1>", self._on_f1_edit_publicacion)
+        # F-keys sobre la fila seleccionada (acciones rápidas de "ir al sitio").
+        # F1: detalle de la venta en ML
+        # F2: detalle del pago en Mercado Pago
+        # F3: editor de la publicación en ML
+        # F4: publicación pública (la que ve el comprador)
+        # F6: abrir las cuatro de una
+        self.root.bind("<F1>", self._on_f1_detalle_venta)
+        self.root.bind("<F2>", self._on_f2_pago_mp)
+        self.root.bind("<F3>", self._on_f3_edit_publicacion)
+        self.root.bind("<F4>", self._on_f4_publi_publica)
+        self.root.bind("<F6>", self._on_f6_abrir_todo)
 
         self.context_menu = tk.Menu(self.tree, tearoff=0)
         self.context_menu.add_command(
@@ -511,7 +511,7 @@ class VentasApp:
 
         self.detail_payment_hint = ttk.Label(
             self.detail_frame,
-            text="Alt + click en la fila → abrir en MP",
+            text="F2 → cobro en MP  ·  F1 venta  ·  F3 editor  ·  F4 publi  ·  F6 todas",
             foreground="#888",
             font=("TkDefaultFont", 9, "italic"),
         )
@@ -1239,7 +1239,7 @@ class VentasApp:
             ).pack(anchor="w")
             ttk.Label(
                 frame,
-                text="Ctrl+Shift+Click en la fila para cargarlo",
+                text="Ctrl+Click en la fila para cargarlo",
                 foreground="#888",
                 font=("TkDefaultFont", 9, "italic"),
             ).pack(anchor="w")
@@ -1265,7 +1265,7 @@ class VentasApp:
             ).pack(anchor="w", pady=(6, 0))
             ttk.Label(
                 frame,
-                text="Ctrl+Shift+Alt+Click en la fila para cargarlo",
+                text="Alt+Click en la fila para cargarlo",
                 foreground="#888",
                 font=("TkDefaultFont", 9, "italic"),
             ).pack(anchor="w")
@@ -1350,44 +1350,137 @@ class VentasApp:
             font=("TkDefaultFont", 12, "bold", "underline"),
         ).pack(side="right")
 
-    def _on_f1_edit_publicacion(self, _event=None):
-        """F1 → abre el editor de la publicación en el browser para la
-        venta seleccionada. Usa la forma corta /publicaciones/{id}/modificar
-        que ML redirige a la URL larga con el token de sesión."""
+    # ────────────────── Atajos de teclado (F1-F6) ──────────────────
+    # Estructura: pequeños URL builders + un helper que devuelve la fila
+    # seleccionada validada, y cada handler de F-key chequea la selección
+    # una sola vez y dispara el browser. F6 reusa los URL builders para
+    # abrir las cuatro pestañas sin repetir 4 veces el mensaje de error.
+
+    def _selected_leaf_data(self):
+        """(leaf_id, info, order_id) del leaf seleccionado o None si no hay
+        venta válida (vacío, día, o info faltante)."""
         sel = self.tree.selection()
+        if not sel:
+            return None
+        leaf_id = sel[0]
+        if self.tree.parent(leaf_id) == "":
+            return None  # fila de día, no de venta
+        info = self.leaf_to_item.get(leaf_id)
+        if not info:
+            return None
+        order_id = self.row_to_order.get(leaf_id)
+        return leaf_id, info, order_id
+
+    def _open_detalle_venta(self, order_id: str):
+        self._open_url(
+            f"https://www.mercadolibre.com.ar/ventas/{order_id}/detalle"
+        )
+
+    def _open_pago_mp(self, query_id):
+        # /activities?q=ID porque /activities/detail/{id} requiere un hash
+        # purchase_v3-{...} impredecible que solo conoce el frontend de MP.
+        # query_id puede ser payment_id (preferido) u order_id como fallback.
+        self._open_url(
+            f"https://www.mercadopago.com.ar/activities?q={query_id}"
+        )
+
+    def _open_publi_edit(self, item_id: str):
+        # ML redirige /publicaciones/{id}/modificar a la URL larga con el
+        # token de sesión, así que la forma corta es estable.
+        self._open_url(
+            f"https://www.mercadolibre.com.ar/publicaciones/{item_id}/modificar"
+        )
+
+    def _open_publi_publica(self, item_id: str):
+        # MLA1234567890 → articulo.mercadolibre.com.ar/MLA-1234567890.
+        if len(item_id) > 3 and item_id[:3].isalpha():
+            url = f"https://articulo.mercadolibre.com.ar/{item_id[:3]}-{item_id[3:]}"
+        else:
+            url = f"https://articulo.mercadolibre.com.ar/{item_id}"
+        self._open_url(url)
+
+    def _on_f1_detalle_venta(self, _e=None):
+        sel = self._selected_leaf_data()
         if not sel:
             self._flash_status("Seleccioná una venta primero")
             return "break"
-        leaf_id = sel[0]
-        info = self.leaf_to_item.get(leaf_id) or {}
+        _, _, order_id = sel
+        if not order_id:
+            self._flash_status("Esta fila no tiene order_id")
+            return "break"
+        self._open_detalle_venta(order_id)
+        self._flash_status(f"Abriendo venta {order_id}")
+        return "break"
+
+    def _on_f2_pago_mp(self, _e=None):
+        sel = self._selected_leaf_data()
+        if not sel:
+            self._flash_status("Seleccioná una venta primero")
+            return "break"
+        _, info, order_id = sel
+        qid = info.get("payment_id") or order_id
+        if not qid:
+            self._flash_status("No hay payment_id ni order_id")
+            return "break"
+        self._open_pago_mp(qid)
+        self._flash_status(f"Abriendo pago {qid}")
+        return "break"
+
+    def _on_f3_edit_publicacion(self, _e=None):
+        sel = self._selected_leaf_data()
+        if not sel:
+            self._flash_status("Seleccioná una venta primero")
+            return "break"
+        _, info, _ = sel
         item_id = info.get("item_id") or ""
         if not item_id:
             self._flash_status("Esta fila no tiene ID de publicación")
             return "break"
-        url = f"https://www.mercadolibre.com.ar/publicaciones/{item_id}/modificar"
-        self._open_url(url)
+        self._open_publi_edit(item_id)
         self._flash_status(f"Abriendo editor de {item_id}")
         return "break"
 
-    def _on_alt_click(self, event):
-        row = self.tree.identify_row(event.y)
-        if not row:
-            return
-        # Preferimos buscar por payment_id (el ID nativo de MP). El order_id
-        # de ML a veces lo matchea el search de MP y a veces no — depende de
-        # cómo MP indexó la relación. payment_id siempre anda.
-        # Fallback al order_id si por alguna razón no tenemos payment_id.
-        info = self.leaf_to_item.get(row) or {}
-        query_id = info.get("payment_id") or self.row_to_order.get(row)
-        if not query_id:
-            return
-        # Usamos /activities?q=ID porque /activities/detail/{id} requiere un hash
-        # purchase_v3-{...} impredecible que solo conoce el frontend de MP.
-        url = f"https://www.mercadopago.com.ar/activities?q={query_id}"
-        self._open_url(url)
+    def _on_f4_publi_publica(self, _e=None):
+        sel = self._selected_leaf_data()
+        if not sel:
+            self._flash_status("Seleccioná una venta primero")
+            return "break"
+        _, info, _ = sel
+        item_id = info.get("item_id") or ""
+        if not item_id:
+            self._flash_status("Esta fila no tiene ID de publicación")
+            return "break"
+        self._open_publi_publica(item_id)
+        self._flash_status(f"Abriendo publicación {item_id}")
         return "break"
 
-    def _on_ctrl_shift_click(self, event):
+    def _on_f6_abrir_todo(self, _e=None):
+        """Abre F1+F2+F3+F4 en pestañas separadas. Mensaje de error único."""
+        sel = self._selected_leaf_data()
+        if not sel:
+            self._flash_status("Seleccioná una venta primero")
+            return "break"
+        _, info, order_id = sel
+        item_id = info.get("item_id") or ""
+        payment_id = info.get("payment_id") or order_id
+        opened = 0
+        if order_id:
+            self._open_detalle_venta(order_id)
+            opened += 1
+        if payment_id:
+            self._open_pago_mp(payment_id)
+            opened += 1
+        if item_id:
+            self._open_publi_edit(item_id)
+            opened += 1
+            self._open_publi_publica(item_id)
+            opened += 1
+        self._flash_status(f"Abriendo {opened} pestañas en el browser")
+        return "break"
+
+    # ────────────── Mouse: Ctrl+click FOB / Alt+click multiplicador ──────────────
+
+    def _on_ctrl_click_fob(self, event):
         row = self.tree.identify_row(event.y)
         if not row or self.tree.parent(row) == "":
             return "break"
@@ -1483,7 +1576,7 @@ class VentasApp:
         # Refrescar el detalle por si la fila visible es de este SKU.
         self._on_select()
 
-    def _on_ctrl_shift_alt_click(self, event):
+    def _on_alt_click_mult(self, event):
         row = self.tree.identify_row(event.y)
         if not row or self.tree.parent(row) == "":
             return "break"
@@ -1496,7 +1589,7 @@ class VentasApp:
             return "break"
         if local_store.get_fob(sku) is None:
             self._flash_status(
-                "Cargá primero el precio FOB (Ctrl+Shift+Click)"
+                "Cargá primero el precio FOB (Ctrl+Click)"
             )
             return "break"
         self._open_mult_modal(sku, info.get("title") or "")
@@ -2260,35 +2353,6 @@ class VentasApp:
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.focus_set()
 
-    def _on_ctrl_click(self, event):
-        row = self.tree.identify_row(event.y)
-        if not row or self.tree.parent(row) == "":
-            return "break"
-        info = self.leaf_to_item.get(row)
-        item_id = (info or {}).get("item_id")
-        if not item_id:
-            return "break"
-        # MLA1234567890 -> articulo.mercadolibre.com.ar/MLA-1234567890 (redirige al canónico)
-        if len(item_id) > 3 and item_id[:3].isalpha():
-            url = f"https://articulo.mercadolibre.com.ar/{item_id[:3]}-{item_id[3:]}"
-        else:
-            url = f"https://articulo.mercadolibre.com.ar/{item_id}"
-        self._open_url(url)
-        self._flash_status(f"Abriendo publicación {item_id}")
-        return "break"
-
-    def _on_shift_click(self, event):
-        row = self.tree.identify_row(event.y)
-        if not row or self.tree.parent(row) == "":
-            return "break"
-        order_id = self.row_to_order.get(row)
-        if not order_id:
-            return "break"
-        url = f"https://www.mercadolibre.com.ar/ventas/{order_id}/detalle"
-        self._open_url(url)
-        self._flash_status(f"Abriendo venta {order_id}")
-        return "break"
-
     def _on_double_click(self, event):
         row = self.tree.identify_row(event.y)
         if not row or self.tree.parent(row) == "":
@@ -2894,18 +2958,10 @@ class VentasApp:
 
     def _refresh_modifier_hint(self):
         mods = self._modifiers_active
-        if "ctrl" in mods and "shift" in mods and "alt" in mods:
-            self.status_var.set(
-                "⌨ Ctrl+Shift+Alt + click → editar multiplicador"
-            )
-        elif "ctrl" in mods and "shift" in mods:
-            self.status_var.set("⌨ Ctrl+Shift + click → editar precio FOB")
-        elif "ctrl" in mods:
-            self.status_var.set("⌨ Ctrl + click → abrir publicación en el browser")
-        elif "shift" in mods:
-            self.status_var.set("⌨ Shift + click → abrir detalle de la venta")
+        if "ctrl" in mods:
+            self.status_var.set("⌨ Ctrl + click → editar precio FOB")
         elif "alt" in mods:
-            self.status_var.set("⌨ Alt + click → abrir cobro en Mercado Pago")
+            self.status_var.set("⌨ Alt + click → editar multiplicador")
 
     def _flash_status(self, msg: str, ms: int = 2500):
         prev = self.status_var.get()

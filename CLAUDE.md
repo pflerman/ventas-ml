@@ -31,6 +31,24 @@ Estructura del JSON:
 
 **`data.json` SÍ va al repo** — Pablo carga FOBs, multiplicadores, etiquetas y netos a mano y los necesita en cualquier máquina donde corra la app. Que los checks y notas vivan ahí también es un efecto colateral asumido (mismo archivo).
 
+## Atajos de teclado y mouse
+
+Sobre la fila seleccionada del Treeview:
+
+| Tecla / mouse        | Acción                                              |
+|----------------------|-----------------------------------------------------|
+| Doble click          | Modal "Editar SKU" (PUT a ML)                       |
+| Ctrl + click         | Modal "Editar precio FOB"                           |
+| Alt + click          | Modal "Editar multiplicador"                        |
+| Click derecho        | Menú contextual (copiar SKU/título/ID, refrescar)   |
+| F1                   | Detalle de la venta en ML (`/ventas/{id}/detalle`)  |
+| F2                   | Cobro en Mercado Pago (`activities?q={payment_id}`) |
+| F3                   | Editor de la publicación (`/publicaciones/{id}/modificar`) |
+| F4                   | Publicación pública (`articulo.mercadolibre.com.ar`) |
+| F6                   | Abre las cuatro de F1-F4 en pestañas separadas      |
+
+Los handlers de F-keys están centralizados en una sección con `_selected_leaf_data()` (devuelve `(leaf_id, info, order_id)` validados) + URL builders chiquitos (`_open_detalle_venta`, `_open_pago_mp`, `_open_publi_edit`, `_open_publi_publica`). F6 reusa los builders sin duplicar la validación. Si tocás los URLs, tocá el builder, no los handlers.
+
 ## Trampas
 
 ### Tupla `values` del Treeview
@@ -39,7 +57,7 @@ Estructura del JSON:
 
 ### `leaf_to_item` vs `row_to_order` vs `_all_leaves()`
 
-- **`leaf_to_item[leaf_id]`** → datos por venta que no están en `values` (item_id, payment_id, neto, shipping_cost, etc).
+- **`leaf_to_item[leaf_id]`** → datos por venta que no están en `values` (item_id, variation_id, payment_id, total_amount, quantity, etc).
 - **`row_to_order`** → TODAS las leaves cargadas, incluso detached por filtro. Usar para totales que no deben depender del filtro.
 - **`_all_leaves()`** → solo visibles. Usar para conteos visuales.
 
