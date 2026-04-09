@@ -647,6 +647,34 @@ class VentasApp:
             font=("TkDefaultFont", 9),
         ).pack(anchor="w")
 
+        # Chip "⚡ Flex con bonificación": cuando el shipment es self_service
+        # (Flex) y el cost al seller es 0, MP suele sumarle al seller una
+        # bonificación que el API público no expone. Avisamos al usuario que
+        # la "Ganancia Mercado Pago" calculada está SUBESTIMADA en este caso.
+        # Ver investigación en CLAUDE.md / sesión "discrepancia con MP".
+        if (
+            info.get("shipping_loaded")
+            and info.get("logistic_type") == "self_service"
+            and float(info.get("shipping_cost") or 0) == 0
+        ):
+            ttk.Label(
+                self.detail_payment_frame,
+                text="⚡ Flex con bonificación de envío",
+                foreground="#d35400",
+                font=("TkDefaultFont", 10, "bold"),
+            ).pack(anchor="w", pady=(8, 0))
+            ttk.Label(
+                self.detail_payment_frame,
+                text=(
+                    "MP te suma un crédito por hacer el envío que el API\n"
+                    "no expone. El total real va a ser MAYOR que la\n"
+                    "Ganancia mostrada arriba."
+                ),
+                foreground="#888",
+                font=("TkDefaultFont", 9, "italic"),
+                justify="left",
+            ).pack(anchor="w")
+
     def _render_ganancia(self, info: dict | None):
         frame = self.detail_ganancia_frame
         costo_unitario = self._last_costo_unitario
@@ -2816,13 +2844,20 @@ class VentasApp:
         self._flash_status(f"SKUs sincronizados ({len(updates)})")
 
     def _refresh_shipping_costs_batch(self, leaf_ids: list):
-        """Trae el costo real del envío para cada leaf desde
-        /shipments/{id}/costs y actualiza el neto en el main thread.
+        """Trae el costo real del envío + el logistic_type del shipment para
+        cada leaf y actualiza el neto en el main thread.
 
-        El listado de orders no trae el shipping_cost real (siempre viene null
-        o 0). Hacemos 1 request por shipment_id único, en paralelo con un pool
-        chico para no martillar la API. Cache de proceso así si recargamos no
-        repetimos los mismos shipments.
+        Hacemos DOS requests por shipment_id único:
+          - /shipments/{id}/costs → senders[0].cost  (costo real al seller)
+          - /shipments/{id}        → logistic_type   (para detectar Flex)
+
+        Necesitamos los dos: el cost va al cálculo del neto, el logistic_type
+        sirve para mostrar el chip "⚡ Flex con bonificación" en el panel
+        cuando MP suma una bonificación al seller que el API público no
+        expone (ver _render_payment).
+
+        Cache de proceso por shipment_id para no repetir nunca el mismo par
+        de requests.
         """
         from concurrent.futures import ThreadPoolExecutor
 
@@ -2835,11 +2870,12 @@ class VentasApp:
             sid = info.get("shipment_id")
             if not sid:
                 # Sin envío → loaded con cost 0, marcamos para no reintentar.
-                self.root.after(0, self._on_shipping_cost_loaded, lid, 0.0)
+                self.root.after(0, self._on_shipping_cost_loaded, lid, 0.0, None)
                 continue
             cached = self._shipping_cost_cache.get(sid)
             if cached is not None:
-                self.root.after(0, self._on_shipping_cost_loaded, lid, cached)
+                cost, ltype = cached
+                self.root.after(0, self._on_shipping_cost_loaded, lid, cost, ltype)
                 continue
             pendientes.append((lid, sid))
 
@@ -2848,33 +2884,48 @@ class VentasApp:
 
         def fetch_one(args):
             lid, sid = args
+            cost = 0.0
+            logistic_type = None
+            headers = {"Authorization": f"Bearer {self.auth.access_token}"}
             try:
-                url = f"https://api.mercadolibre.com/shipments/{sid}/costs"
                 req = Request(
-                    url,
-                    headers={"Authorization": f"Bearer {self.auth.access_token}"},
+                    f"https://api.mercadolibre.com/shipments/{sid}/costs",
+                    headers=headers,
                 )
                 with urlopen(req, timeout=15) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                 senders = data.get("senders") or []
                 cost = float((senders[0] or {}).get("cost") or 0) if senders else 0.0
             except Exception:
-                cost = 0.0
-            self._shipping_cost_cache[sid] = cost
-            self.root.after(0, self._on_shipping_cost_loaded, lid, cost)
+                pass
+            try:
+                req = Request(
+                    f"https://api.mercadolibre.com/shipments/{sid}",
+                    headers=headers,
+                )
+                with urlopen(req, timeout=15) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                logistic_type = data.get("logistic_type")
+            except Exception:
+                pass
+            self._shipping_cost_cache[sid] = (cost, logistic_type)
+            self.root.after(
+                0, self._on_shipping_cost_loaded, lid, cost, logistic_type
+            )
 
         with ThreadPoolExecutor(max_workers=8) as ex:
             list(ex.map(fetch_one, pendientes))
 
-    def _on_shipping_cost_loaded(self, leaf_id: str, cost: float):
-        """Callback main-thread: aplica el shipping cost a una venta y
-        recalcula el neto. Refresca panel de detalle si la fila está
-        seleccionada y actualiza el mini totalizador."""
+    def _on_shipping_cost_loaded(self, leaf_id: str, cost: float, logistic_type):
+        """Callback main-thread: aplica el shipping cost + logistic_type a
+        una venta y recalcula el neto. Refresca panel de detalle si la fila
+        está seleccionada y actualiza el mini totalizador."""
         info = self.leaf_to_item.get(leaf_id)
         if info is None:
             return
         info["shipping_cost"] = cost
         info["shipping_loaded"] = True
+        info["logistic_type"] = logistic_type
         info["neto"] = (
             float(info.get("total_amount") or 0)
             - float(info.get("sale_fee") or 0)
