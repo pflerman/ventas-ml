@@ -3696,6 +3696,12 @@ class VentasApp:
 
     def _refresh_tree_filter(self):
         """Aplica los filtros actuales sobre las leaves cargadas (detach/move)."""
+        # Guard: este callback puede dispararse durante _build_ui (vía
+        # trace_add de los filter vars cuando _setup_filter_placeholder
+        # set()ea el placeholder) antes de que self.tree exista. Si no
+        # hay tree todavía, simplemente no hacemos nada.
+        if not hasattr(self, "tree"):
+            return
         buscar_raw = self._get_filter_text(self._buscar_var, self._BUSCAR_PLACEHOLDER)
         excluir_raw = self._get_filter_text(
             self._excluir_var, self._EXCLUIR_PLACEHOLDER
