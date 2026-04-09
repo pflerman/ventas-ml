@@ -232,6 +232,18 @@ class VentasApp:
             filter_bar, text="Limpiar", command=self._limpiar_filtros
         ).pack(side="left")
 
+        # Toggle "solo con nota" — filtra el tree para mostrar únicamente
+        # ventas que tienen una nota asociada en ventas_db (casos que el
+        # usuario marcó como "sospechosos para revisar después").
+        self._solo_con_nota_var = tk.BooleanVar(value=False)
+        self._solo_con_nota_chk = ttk.Checkbutton(
+            filter_bar,
+            text="📝 Solo con nota",
+            variable=self._solo_con_nota_var,
+            command=self._refresh_tree_filter,
+        )
+        self._solo_con_nota_chk.pack(side="left", padx=(12, 0))
+
         # Panel lateral scrollable: PanedWindow ⊃ outer ⊃ Canvas + Scrollbar,
         # con `detail_frame` viviendo adentro del Canvas via create_window.
         # El resto del código sigue manipulando self.detail_frame sin enterarse.
@@ -370,6 +382,10 @@ class VentasApp:
         self.tree.tag_configure(
             "day", background="#dce6f0", font=("TkDefaultFont", 11, "bold")
         )
+        # Filas con nota: foreground violeta (no toca el background así no
+        # pisa al tag "selected" del check). Es una señal visual de que ese
+        # caso lo marcaste para revisar después.
+        self.tree.tag_configure("with_note", foreground="#7d3c98")
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=vsb.set)
@@ -495,6 +511,40 @@ class VentasApp:
         self.detail_ganancia_frame = ttk.Frame(self.detail_frame)
         self.detail_ganancia_frame.pack(fill="x", anchor="w")
 
+        # ─── Nota libre por venta ───
+        # Persistida en ventas_db (tabla ventas_notas) por order_id.
+        # Autosave on focus-out con thread async para no bloquear la UI.
+        ttk.Separator(self.detail_frame, orient="horizontal").pack(
+            fill="x", pady=(16, 6)
+        )
+        ttk.Label(
+            self.detail_frame,
+            text="📝 Nota",
+            font=("TkDefaultFont", 10, "bold"),
+            foreground="#7d3c98",
+        ).pack(anchor="w")
+        self.detail_nota_text = tk.Text(
+            self.detail_frame,
+            height=4,
+            wrap="word",
+            font=("TkDefaultFont", 10),
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=0,
+        )
+        self.detail_nota_text.pack(fill="x", anchor="w", pady=(2, 0))
+        # State para no pisar la nota cuando recién cargás otra venta
+        # (la primer carga es _load_nota_into_widget, no input del usuario).
+        self._nota_loading = False
+        self._nota_current_order: str | None = None
+        self.detail_nota_text.bind("<FocusOut>", self._on_nota_focus_out)
+        ttk.Label(
+            self.detail_frame,
+            text="Se guarda automáticamente al cambiar de venta.",
+            foreground="#888",
+            font=("TkDefaultFont", 9, "italic"),
+        ).pack(anchor="w", pady=(2, 0))
+
         ttk.Separator(self.detail_frame, orient="horizontal").pack(
             fill="x", pady=(16, 8)
         )
@@ -510,13 +560,19 @@ class VentasApp:
             return
         leaf_id = sel[0]
         info = self.leaf_to_item.get(leaf_id)
+        # Antes de cambiar de selección, persistir la nota de la venta
+        # anterior si quedó editada y no la guardó el FocusOut.
+        self._flush_nota_pendiente()
         if not info:
             # Es una fila de día, no una venta
             self._update_detail(None, None, None)
+            self._load_nota_into_widget(None)
             return
         sku = info.get("sku") or ""
         producto = productos_lookup.get(sku) if sku else None
         self._update_detail(sku, producto, info)
+        order_id = self.row_to_order.get(leaf_id)
+        self._load_nota_into_widget(order_id)
 
     def _update_detail(self, sku: str | None, producto: dict | None, info: dict | None):
         # Limpiar chips anteriores
@@ -805,6 +861,84 @@ class VentasApp:
                 background=chip_bg,
                 font=("TkDefaultFont", 9, "bold"),
             ).pack(side="left")
+
+    # ────────────── Notas por venta ──────────────
+
+    def _load_nota_into_widget(self, order_id: str | None):
+        """Carga la nota persistida en el Text widget. Marca _nota_loading
+        para que el FocusOut no la "guarde" como input del usuario."""
+        self._nota_loading = True
+        self._nota_current_order = order_id
+        self.detail_nota_text.delete("1.0", "end")
+        if order_id:
+            nota = ventas_db.get_nota(order_id)
+            if nota:
+                self.detail_nota_text.insert("1.0", nota)
+        self._nota_loading = False
+
+    def _on_nota_focus_out(self, _event=None):
+        """Cuando el usuario sale del Text widget, persiste si cambió."""
+        if self._nota_loading:
+            return
+        order_id = self._nota_current_order
+        if not order_id:
+            return
+        nuevo = self.detail_nota_text.get("1.0", "end-1c").strip()
+        viejo = ventas_db.get_nota(order_id)
+        if nuevo == viejo:
+            return
+        # Update optimista en cache + tag visual + filtro.
+        ventas_db.set_nota_local(order_id, nuevo)
+        self._refresh_leaf_nota_tag(order_id)
+        # Persist en background.
+        self._persist_nota_async(order_id, nuevo)
+        self._update_status()
+
+    def _flush_nota_pendiente(self):
+        """Llamado al cambiar de selección: si la nota actual está editada
+        y no se guardó (porque el usuario no perdió foco todavía), guardala
+        ahora antes de que se sobreescriba con la nota de la venta nueva."""
+        if self._nota_loading:
+            return
+        order_id = self._nota_current_order
+        if not order_id:
+            return
+        nuevo = self.detail_nota_text.get("1.0", "end-1c").strip()
+        viejo = ventas_db.get_nota(order_id)
+        if nuevo == viejo:
+            return
+        ventas_db.set_nota_local(order_id, nuevo)
+        self._refresh_leaf_nota_tag(order_id)
+        self._persist_nota_async(order_id, nuevo)
+
+    def _refresh_leaf_nota_tag(self, order_id: str):
+        """Actualiza el tag visual del row del tree para que aparezca/desaparezca
+        el foreground violeta de "tiene nota"."""
+        for leaf_id, oid in self.row_to_order.items():
+            if oid != order_id:
+                continue
+            try:
+                self.tree.item(
+                    leaf_id, tags=self._row_tags(leaf_id, order_id)
+                )
+            except tk.TclError:
+                pass
+        # Si el filtro "solo con nota" está activo, refrescar el tree
+        # porque la fila puede haber entrado o salido del set visible.
+        if self._solo_con_nota_var.get():
+            self._refresh_tree_filter()
+
+    def _persist_nota_async(self, order_id: str, nota: str):
+        def worker():
+            try:
+                ventas_db.persist_nota(order_id, nota)
+            except Exception as e:
+                self.root.after(
+                    0, lambda m=str(e): self._flash_status(
+                        f"⚠️ Error guardando nota: {m[:80]}", ms=4000
+                    )
+                )
+        threading.Thread(target=worker, daemon=True).start()
 
     def _render_costo(self, producto: dict | None, sku: str | None):
         frame = self.detail_costo_frame
@@ -1668,6 +1802,9 @@ class VentasApp:
             if self.root.focus_get() is not entry:
                 entry.insert(0, placeholder)
                 entry.configure(foreground="#888")
+        # También apagar el toggle de "solo con nota" si está prendido.
+        if self._solo_con_nota_var.get():
+            self._solo_con_nota_var.set(False)
 
     def _refresh_tree_filter(self):
         """Aplica los filtros actuales sobre las leaves cargadas (detach/move)."""
@@ -1677,7 +1814,8 @@ class VentasApp:
         )
         buscar_words = [_normalize(w) for w in buscar_raw.split() if w.strip()]
         excluir_words = [_normalize(w) for w in excluir_raw.split() if w.strip()]
-        filter_active = bool(buscar_words or excluir_words)
+        solo_con_nota = self._solo_con_nota_var.get()
+        filter_active = bool(buscar_words or excluir_words or solo_con_nota)
 
         # Decidir qué leaves quedan visibles, agrupados por día y en orden original.
         visible_per_day: dict[str, list] = {}
@@ -1689,6 +1827,10 @@ class VentasApp:
                 continue
             if excluir_words and all(w in row_text for w in excluir_words):
                 continue
+            if solo_con_nota:
+                order_id = self.row_to_order.get(leaf_id)
+                if not order_id or not ventas_db.has_nota(order_id):
+                    continue
             visible_per_day.setdefault(meta["day_key"], []).append(leaf_id)
 
         # Detach todas las leaves de todas las días (sin tocar los días en sí).
@@ -1938,9 +2080,10 @@ class VentasApp:
 
     def _row_tags(self, row_id: str, order_id: str) -> tuple:
         base = self.row_base.get(row_id, "even")
-        if ventas_db.is_checked(order_id):
-            return ("selected",)
-        return (base,)
+        tags: list[str] = ["selected"] if ventas_db.is_checked(order_id) else [base]
+        if ventas_db.has_nota(order_id):
+            tags.append("with_note")
+        return tuple(tags)
 
     def _on_right_click(self, event):
         row = self.tree.identify_row(event.y)
@@ -2782,12 +2925,14 @@ class VentasApp:
             checked = ventas_db.is_checked(order_id)
             mark = CHECKED if checked else UNCHECKED
             base = "odd" if (start_idx + i) % 2 else "even"
-            tags = ("selected",) if checked else (base,)
+            tags_list = ["selected"] if checked else [base]
+            if ventas_db.has_nota(order_id):
+                tags_list.append("with_note")
             leaf_id = self.tree.insert(
                 parent_id,
                 "end",
                 values=(mark, time_str, sku, quantity, title, price_str, subtotal_str),
-                tags=tags,
+                tags=tuple(tags_list),
             )
             self.row_to_order[leaf_id] = order_id
             self.row_base[leaf_id] = base

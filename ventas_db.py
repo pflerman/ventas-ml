@@ -1,9 +1,10 @@
-"""Persistencia de checks de ventas y precios FOB en Turso (compartida con gestor-productos).
+"""Persistencia de checks de ventas, precios FOB y notas en Turso (compartida con gestor-productos).
 
 Cache en memoria + write-through, mismo patrón que `gestor-productos/app/db.py`.
 
 - ventas_checks: una fila por order_id marcado. Presencia = checkeado.
 - ventas_fob:    una fila por SKU con su precio FOB en USD.
+- ventas_notas:  una fila por order_id con la nota libre del usuario.
 
 Las credenciales se leen del .env de gestor-productos (la DB es la misma).
 """
@@ -23,6 +24,7 @@ TURSO_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
 _checks: set[str] = set()           # order_ids marcados
 _fob: dict[str, float] = {}         # sku -> precio_fob (USD)
 _mult: dict[str, int] = {}          # sku -> multiplicador (unidades por publicación)
+_notas: dict[str, str] = {}         # order_id -> texto libre de la nota
 _loaded = False
 
 
@@ -77,13 +79,20 @@ def init_db() -> None:
         _execute("ALTER TABLE ventas_fob ADD COLUMN multiplicador INTEGER")
     except Exception:
         pass  # Ya existe
+    _execute("""
+        CREATE TABLE IF NOT EXISTS ventas_notas (
+            order_id   TEXT PRIMARY KEY,
+            nota       TEXT NOT NULL,
+            updated_at INTEGER
+        )
+    """)
     _load_cache()
     _loaded = True
 
 
 def _load_cache() -> None:
-    """Descarga checks, FOBs y multiplicadores a memoria. Una request por tabla."""
-    global _checks, _fob, _mult
+    """Descarga checks, FOBs, multiplicadores y notas a memoria. Una request por tabla."""
+    global _checks, _fob, _mult, _notas
 
     resp = _execute("SELECT order_id FROM ventas_checks")
     _checks = {
@@ -110,6 +119,14 @@ def _load_cache() -> None:
                 pass
     _fob = fob
     _mult = mult
+
+    resp = _execute("SELECT order_id, nota FROM ventas_notas")
+    notas: dict[str, str] = {}
+    for row in resp["rows"]:
+        if row[0]["type"] == "null" or row[1]["type"] == "null":
+            continue
+        notas[row[0]["value"]] = row[1]["value"]
+    _notas = notas
 
 
 def loaded() -> bool:
@@ -200,3 +217,49 @@ def set_multiplicador(sku: str, valor: int) -> None:
             f"No hay precio FOB cargado para {sku}. Cargá el FOB primero."
         )
     _mult[sku] = valor
+
+
+# ---------- Notas ----------
+
+def get_nota(order_id: str) -> str:
+    """Devuelve la nota del order_id, o "" si no tiene."""
+    if not order_id:
+        return ""
+    return _notas.get(order_id, "")
+
+
+def has_nota(order_id: str) -> bool:
+    return bool(_notas.get(order_id))
+
+
+def count_with_nota() -> int:
+    return len(_notas)
+
+
+def all_with_nota() -> set[str]:
+    """Retorna copia del set de order_ids que tienen nota (no vacía)."""
+    return set(_notas.keys())
+
+
+def set_nota_local(order_id: str, nota: str) -> None:
+    """Actualiza solo la cache en memoria. Para updates optimistas main thread.
+    Si nota vacía, borra de la cache."""
+    if nota:
+        _notas[order_id] = nota
+    else:
+        _notas.pop(order_id, None)
+
+
+def persist_nota(order_id: str, nota: str) -> None:
+    """Escribe la nota en Turso. NO toca la cache. Pensado para correr en thread.
+    Si la nota es vacía, borra la fila."""
+    import time
+    if nota:
+        _execute(
+            "INSERT INTO ventas_notas (order_id, nota, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(order_id) DO UPDATE SET nota = excluded.nota, "
+            "updated_at = excluded.updated_at",
+            [order_id, nota, int(time.time())],
+        )
+    else:
+        _execute("DELETE FROM ventas_notas WHERE order_id = ?", [order_id])
