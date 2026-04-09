@@ -111,6 +111,18 @@
       "activo": true,
       "facturado": true,
       "nota": "7"
+    },
+    {
+      "id": "93d773876b",
+      "fecha_creacion": "666",
+      "fecha_desde": "6",
+      "fecha_hasta": "6",
+      "fecha_pago": "6",
+      "monto_deuda": 6.0,
+      "credito": 6.0,
+      "activo": true,
+      "facturado": false,
+      "nota": "6"
     }
   ],
   "liquidacion_links": {
