@@ -3,6 +3,7 @@
 import io
 import json
 import os
+import re
 import sys
 import threading
 import tkinter as tk
@@ -1826,8 +1827,45 @@ class VentasApp:
         ttk.Label(frame, text="Neto MP (ARS):").pack(anchor="w")
         actual = local_store.get_neto_manual(order_id)
         neto_var = tk.StringVar(value=f"{actual:.2f}" if actual else "")
-        entry = ttk.Entry(frame, textvariable=neto_var, width=20)
-        entry.pack(anchor="w", pady=(2, 12))
+        entry_row = ttk.Frame(frame)
+        entry_row.pack(anchor="w", pady=(2, 12))
+        entry = ttk.Entry(entry_row, textvariable=neto_var, width=20)
+        entry.pack(side="left")
+
+        def do_format():
+            """'$29.750,28' → '29750.28'"""
+            raw = neto_var.get().strip()
+            # Sacar todo menos dígitos, puntos y comas
+            cleaned = ""
+            for ch in raw:
+                if ch.isdigit() or ch in ".,":
+                    cleaned += ch
+            if not cleaned:
+                return
+            # Detectar formato AR: si hay coma seguida de 1-2 dígitos al final,
+            # es el separador decimal; los puntos son miles.
+            m = re.match(r'^([\d.]+),(\d{1,2})$', cleaned)
+            if m:
+                integer_part = m.group(1).replace(".", "")
+                decimal_part = m.group(2)
+                cleaned = f"{integer_part}.{decimal_part}"
+            else:
+                # Sin coma: los puntos podrían ser miles (ej "29.750")
+                # o decimal (ej "29750.28"). Si hay un punto seguido de
+                # exactamente 3 dígitos al final, es separador de miles.
+                m2 = re.match(r'^([\d.]+)\.(\d{3})$', cleaned)
+                if m2:
+                    cleaned = cleaned.replace(".", "")
+            try:
+                val = float(cleaned)
+                neto_var.set(f"{val:.2f}")
+                entry.select_range(0, "end")
+            except ValueError:
+                pass
+
+        ttk.Button(entry_row, text="Limpiar", width=8, command=do_format).pack(
+            side="left", padx=(6, 0)
+        )
         entry.focus_set()
         entry.select_range(0, "end")
 
