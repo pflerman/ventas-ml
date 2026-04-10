@@ -1495,9 +1495,10 @@ class VentasApp:
         self._load_nota_into_widget(order_id)
 
     def _update_detail(self, sku: str | None, info: dict | None, order_id: str | None):
-        # Esconder el panel entero durante el rebuild para que Tk no haga
-        # relayout por cada widget destruido/creado (~60-70 widgets).
-        self.detail_canvas.itemconfigure(self._detail_window_id, state="hidden")
+        # Desactivar el handler <Configure> durante el rebuild para que Tk
+        # no recalcule scrollregion por cada widget destruido/creado (~140
+        # eventos). Lo reactivamos al final con un solo recálculo.
+        self.detail_frame.unbind("<Configure>")
 
         # Limpiar contenido anterior
         for f in (self.detail_tags_frame, self.detail_payment_frame,
@@ -1517,8 +1518,16 @@ class VentasApp:
         self._render_payment(info, order_id)
         self._render_ganancia(info, order_id)
 
-        # Mostrar el panel de nuevo.
-        self.detail_canvas.itemconfigure(self._detail_window_id, state="normal")
+        # Reactivar <Configure> y recalcular scrollregion una sola vez.
+        self.detail_frame.bind(
+            "<Configure>",
+            lambda e: self.detail_canvas.configure(
+                scrollregion=self.detail_canvas.bbox("all")
+            ),
+        )
+        self.detail_canvas.configure(
+            scrollregion=self.detail_canvas.bbox("all")
+        )
 
         # Cachear SKU para el picker de etiquetas.
         self._detail_current_sku = sku or None
