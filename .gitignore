@@ -5,3 +5,5 @@ __pycache__/
 venv/
 .env
 seleccionadas.json
+spike_gtk4.py
+app_gtk4.py
