@@ -1486,26 +1486,25 @@ class VentasApp:
         self._flush_nota_pendiente()
         if not info:
             # Es una fila de día, no una venta
-            self._update_detail(None, None)
+            self._update_detail(None, None, None)
             self._load_nota_into_widget(None)
             return
         sku = info.get("sku") or ""
-        self._update_detail(sku, info)
         order_id = self.row_to_order.get(leaf_id)
+        self._update_detail(sku, info, order_id)
         self._load_nota_into_widget(order_id)
 
-    def _update_detail(self, sku: str | None, info: dict | None):
+    def _update_detail(self, sku: str | None, info: dict | None, order_id: str | None):
+        # Esconder el panel entero durante el rebuild para que Tk no haga
+        # relayout por cada widget destruido/creado (~60-70 widgets).
+        self.detail_canvas.itemconfigure(self._detail_window_id, state="hidden")
+
         # Limpiar contenido anterior
-        for w in self.detail_tags_frame.winfo_children():
-            w.destroy()
-        for w in self.detail_payment_frame.winfo_children():
-            w.destroy()
-        for w in self.detail_costo_frame.winfo_children():
-            w.destroy()
-        for w in self.detail_andres_frame.winfo_children():
-            w.destroy()
-        for w in self.detail_ganancia_frame.winfo_children():
-            w.destroy()
+        for f in (self.detail_tags_frame, self.detail_payment_frame,
+                  self.detail_costo_frame, self.detail_andres_frame,
+                  self.detail_ganancia_frame):
+            for w in f.winfo_children():
+                w.destroy()
 
         # Reset de los costos calculados (los setea _render_costo si puede).
         self._last_costo_unitario = None
@@ -1515,8 +1514,11 @@ class VentasApp:
         self._last_pack_mult = None
         self._render_costo(sku, info)
         self._render_andres(info)
-        self._render_payment(info)
-        self._render_ganancia(info)
+        self._render_payment(info, order_id)
+        self._render_ganancia(info, order_id)
+
+        # Mostrar el panel de nuevo.
+        self.detail_canvas.itemconfigure(self._detail_window_id, state="normal")
 
         # Cachear SKU para el picker de etiquetas.
         self._detail_current_sku = sku or None
@@ -1663,7 +1665,7 @@ class VentasApp:
         win.geometry(f"+{x}+{y}")
         win.grab_set()
 
-    def _render_payment(self, info: dict | None):
+    def _render_payment(self, info: dict | None, order_id: str | None = None):
         if not info or info.get("payment_id") is None:
             ttk.Label(
                 self.detail_payment_frame,
@@ -1687,7 +1689,6 @@ class VentasApp:
         ).pack(side="right")
 
         # Neto MP + envío manual (ambos cargados a mano).
-        order_id = self._current_order_id_for_info(info)
         neto = local_store.get_neto_manual(order_id) if order_id else None
         shipping = local_store.get_shipping_manual(order_id) if order_id else None
 
@@ -1789,16 +1790,6 @@ class VentasApp:
             foreground="#888",
             font=("TkDefaultFont", 9),
         ).pack(anchor="w")
-
-    def _current_order_id_for_info(self, info: dict | None) -> str | None:
-        """Helper: dado un info dict, encontrar el order_id correspondiente
-        en row_to_order. Es la única manera porque info no guarda order_id."""
-        if not info:
-            return None
-        for leaf_id, oid in self.row_to_order.items():
-            if self.leaf_to_item.get(leaf_id) is info:
-                return oid
-        return None
 
     def _open_neto_modal(self, order_id: str | None):
         """Modal chico para cargar/editar el neto MP de una venta."""
@@ -2005,10 +1996,9 @@ class VentasApp:
         win.geometry(f"+{x}+{y}")
         win.grab_set()
 
-    def _render_ganancia(self, info: dict | None):
+    def _render_ganancia(self, info: dict | None, order_id: str | None = None):
         frame = self.detail_ganancia_frame
         costo_unitario = self._last_costo_unitario
-        order_id = self._current_order_id_for_info(info) if info else None
         # neto efectivo = neto MP - envío manual (si está cargado).
         neto = local_store.get_neto_efectivo(order_id) if order_id else None
 
