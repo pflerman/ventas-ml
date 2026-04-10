@@ -2475,7 +2475,7 @@ class VentasApp:
         row_ind.pack(fill="x", anchor="w", pady=(4, 1))
         lbl_ind = tk.Label(
             row_ind,
-            text="Pagar a Andrés individual:",
+            text="✏️ Pagar a Andrés individual:",
             foreground="#7d3c98",
             font=("TkDefaultFont", 12, "bold"),
             cursor="hand2",
