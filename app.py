@@ -1526,15 +1526,13 @@ class VentasApp:
             self._refresh_tag_picker()
             return
 
-        if not sku:
-            self.detail_status_var.set("⚠️ Esta venta no tiene SKU")
-            self.detail_status_lbl.configure(foreground="#c0392b")
-            self._refresh_tag_picker()
-            return
-
         title = (info or {}).get("title") or ""
-        self.detail_status_var.set(f"{sku}\n{title}")
-        self.detail_status_lbl.configure(foreground="#333")
+        if not sku:
+            self.detail_status_var.set(f"(sin SKU)\n{title}" if title else "(sin SKU)")
+            self.detail_status_lbl.configure(foreground="#888")
+        else:
+            self.detail_status_var.set(f"{sku}\n{title}")
+            self.detail_status_lbl.configure(foreground="#333")
         self._refresh_tag_picker()
 
     # ────────────── Etiquetas locales (chips + dropdown) ──────────────
@@ -1549,7 +1547,7 @@ class VentasApp:
         if not sku:
             ttk.Label(
                 self.detail_tags_frame,
-                text="(seleccioná una venta con SKU)",
+                text="(sin SKU para etiquetas)",
                 foreground="#888",
             ).pack(anchor="w")
             self._tag_combo.configure(values=[], state="disabled")
@@ -2227,7 +2225,8 @@ class VentasApp:
         frame = self.detail_costo_frame
         if not sku:
             ttk.Label(
-                frame, text="(sin SKU)", foreground="#888"
+                frame, text="Sin SKU — cargá el SKU para costear", foreground="#888",
+                font=("TkDefaultFont", 9, "italic"),
             ).pack(anchor="w")
             return
         fob = local_store.get_fob(sku)
