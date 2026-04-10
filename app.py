@@ -2471,12 +2471,17 @@ class VentasApp:
         # La línea entera es clickeable → abre modal para editar el markup.
         # Mostramos el markup sin ceros innecesarios (1.3 no 1.30, 1.4 no 1.40).
         markup_str = f"{markup:g}"
-        row_ind = ttk.Frame(frame, cursor="hand2")
+        row_ind_bg = "#f0e6f6"
+        row_ind = tk.Frame(
+            frame, cursor="hand2", background=row_ind_bg,
+            highlightbackground="#7d3c98", highlightthickness=2,
+            padx=6, pady=4,
+        )
         row_ind.pack(fill="x", anchor="w", pady=(4, 1))
         lbl_ind = tk.Label(
             row_ind,
             text="✏️ Pagar a Andrés individual:",
-            foreground="#7d3c98",
+            foreground="#7d3c98", background=row_ind_bg,
             font=("TkDefaultFont", 12, "bold"),
             cursor="hand2",
         )
@@ -2493,7 +2498,7 @@ class VentasApp:
         val_ind = tk.Label(
             row_ind,
             text=format_price(andres_unit),
-            foreground="#7d3c98",
+            foreground="#7d3c98", background=row_ind_bg,
             font=("TkDefaultFont", 12, "bold", "underline"),
             cursor="hand2",
         )
