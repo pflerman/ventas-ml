@@ -1,9 +1,39 @@
 {
-  "checks": [
-    "2000015912189958"
-  ],
+  "checks": [],
   "notas": {
-    "2000015908762376": "a cuanto deberia ponerlo"
+    "2000015908762376": "Listo",
+    "2000015912189958": "Listo",
+    "2000015917928010": "Listo",
+    "2000015917709952": "listo",
+    "2000015918211452": "listo",
+    "2000015907553300": "listo",
+    "2000015906400856": "listo",
+    "2000015906070444": "Listo",
+    "2000015906070442": "Listo",
+    "2000015895769450": "listo",
+    "2000015895771540": "Listo",
+    "2000015895767752": "Listo",
+    "2000015895767770": "Listo",
+    "2000015895771514": "Listo",
+    "2000015893620064": "Listo",
+    "2000015891907524": "Listo",
+    "2000015877141598": "Listo",
+    "2000015890703010": "Listo",
+    "2000015874228654": "Listo",
+    "2000015872781872": "Listo",
+    "2000015871568258": "Listo",
+    "2000015870803220": "Listo",
+    "2000015844721146": "Listo",
+    "2000015844592586": "Listo",
+    "2000015841676090": "Listo",
+    "2000015824781458": "Listo",
+    "2000015824481152": "Listo",
+    "2000015822779130": "Listo",
+    "2000015821162272": "Listo",
+    "2000015820299588": "Listo",
+    "2000015810466564": "Listo",
+    "2000015806151494": "Listo",
+    "2000015792348368": "Listo"
   },
   "fob": {
     "PERCHA-MAGICA-3": {
@@ -25,6 +55,50 @@
     "GP-0QH8R3YH": {
       "precio": 0.29,
       "mult": 12
+    },
+    "ORGANIZADOR-REMERA-RIGIDO-BLANCO": {
+      "precio": 0.35,
+      "mult": 10
+    },
+    "GP-VQF9LONR": {
+      "precio": 0.63,
+      "mult": 12
+    },
+    "GP-GUENA7SH": {
+      "precio": 2.5,
+      "mult": 1
+    },
+    "GP-U72NUNN0": {
+      "precio": 2.5,
+      "mult": 1
+    },
+    "GP-9DSJ11BH": {
+      "precio": 2.2,
+      "mult": 6
+    },
+    "GP-RJ108SLZ": {
+      "precio": 0.63,
+      "mult": 6
+    },
+    "ORGANIZADOR-REMERA-RIGIDO-GRIS": {
+      "precio": 0.35,
+      "mult": 10
+    },
+    "GP-5TBDB8Z3": {
+      "precio": 0.52,
+      "mult": 6
+    },
+    "GP-LS5XZ66P": {
+      "precio": 0.54,
+      "mult": 6
+    },
+    "GP-22MMSUQR": {
+      "precio": 0.54,
+      "mult": 12
+    },
+    "GP-IHY67BA5": {
+      "precio": 2.9,
+      "mult": 3
     }
   },
   "etiquetas_catalogo": [
@@ -40,20 +114,39 @@
     "Acrílico Común",
     "Pack 12",
     "Rack",
-    "Rosa"
+    "Rosa",
+    "Pack 6",
+    "Organizador Japonés",
+    "Negro",
+    "Comunes",
+    "Talle 44",
+    "Mediano",
+    "Tapa Rígida",
+    "Transparente",
+    "Talle 40",
+    "Pack 3",
+    "Grande"
   ],
   "etiquetas_por_sku": {
     "PERCHA-MAGICA-3": [
-      "Percha Mágica"
+      "Percha Mágica",
+      "Gris",
+      "Una Unidad"
     ],
     "GP-GUENA7SH": [
-      "Armario Modular"
+      "Armario Modular",
+      "Una Unidad",
+      "Mediano"
     ],
     "GP-U72NUNN0": [
-      "Armario Modular"
+      "Armario Modular",
+      "Mediano",
+      "Una Unidad"
     ],
     "GP-9DSJ11BH": [
-      "Acrílico Con Imanes"
+      "Acrílico Con Imanes",
+      "Pack 6",
+      "Transparente"
     ],
     "ORGANIZADOR-REMERA-RIGIDO-GRIS": [
       "Remera Rígida",
@@ -74,18 +167,109 @@
       "Pack 12",
       "Rack",
       "Rosa"
+    ],
+    "GP-YKAGK1AS": [
+      "Pack 6",
+      "Organizador Japonés",
+      "Negro"
+    ],
+    "ORGANIZADOR-REMERA-RIGIDO-BLANCO": [
+      "Pack 10",
+      "Remera Rígida",
+      "Blanco"
+    ],
+    "GP-VQF9LONR": [
+      "Pack 12",
+      "Comunes",
+      "Talle 44",
+      "Blanco"
+    ],
+    "GP-LAYMI8MM": [
+      "Tapa Rígida"
+    ],
+    "GP-RJ108SLZ": [
+      "Pack 6",
+      "Comunes",
+      "Talle 44",
+      "Blanco"
+    ],
+    "GP-5TBDB8Z3": [
+      "Pack 6",
+      "Comunes",
+      "Talle 40",
+      "Blanco"
+    ],
+    "GP-LS5XZ66P": [
+      "Pack 6",
+      "Tapa Rígida",
+      "Talle 44",
+      "Blanco"
+    ],
+    "GP-22MMSUQR": [
+      "Pack 12",
+      "Tapa Rígida",
+      "Talle 44",
+      "Negro"
+    ],
+    "GP-IHY67BA5": [
+      "Pack 3",
+      "Armario Modular",
+      "Grande"
     ]
   },
   "neto_manual": {
     "2000015906400856": 18813.56,
-    "2000015906070442": 27882.65,
+    "2000015906070442": 10367.8,
     "2000015907553300": 26770.5,
     "2000015908762376": 77753.18,
-    "2000015912189958": 96428.87
+    "2000015912189958": 96428.87,
+    "2000015917928010": 31032.6,
+    "2000015917709952": 38398.56,
+    "2000015918211452": 38355.48,
+    "2000015906070444": 17514.19,
+    "2000015895769450": 15690.6,
+    "2000015895771514": 15690.6,
+    "2000015895767770": 15690.6,
+    "2000015895767752": 15690.6,
+    "2000015895771540": 15690.6,
+    "2000015893620064": 92498.19,
+    "2000015891907524": 29750.28,
+    "2000015877141598": 51835.46,
+    "2000015890703010": 51575.2,
+    "2000015874228654": 33957.43,
+    "2000015872781872": 40911.61,
+    "2000015871568258": 45580.52,
+    "2000015870803220": 32461.52,
+    "2000015844721146": 37786.56,
+    "2000015844592586": 37786.56,
+    "2000015841676090": 45580.52,
+    "2000015824781458": 38151.32,
+    "2000015824481152": 37951.32,
+    "2000015822779130": 38151.32,
+    "2000015821162272": 26542.32,
+    "2000015820299588": 37951.32,
+    "2000015810466564": 37951.32,
+    "2000015806151494": 24965.49,
+    "2000015792348368": 26520.45
   },
   "shipping_manual": {
     "2000015906400856": 6500.0,
-    "2000015907553300": 6500.0
+    "2000015907553300": 6500.0,
+    "2000015895769450": 5979.0,
+    "2000015895771514": 5979.0,
+    "2000015895767770": 5979.0,
+    "2000015895767752": 5979.0,
+    "2000015895771540": 5979.0,
+    "2000015891907524": 6490.0,
+    "2000015890703010": 3983.0,
+    "2000015874228654": 6490.0,
+    "2000015871568258": 5979.0,
+    "2000015841676090": 5979.0,
+    "2000015824781458": 7496.0,
+    "2000015824481152": 5979.0,
+    "2000015822779130": 9064.0,
+    "2000015820299588": 3983.0,
+    "2000015810466564": 5979.0
   },
   "consolidados": [
     {
@@ -127,7 +311,9 @@
   ],
   "liquidacion_links": {
     "2026-05-07": [
-      "https://www.mercadopago.com.ar/activities/detail/purchase_v3-5b9590a08658a52d0a31c607ccad826fee338575?from=afs-embedding-on"
+      "https://www.mercadopago.com.ar/activities/detail/purchase_v3-5b9590a08658a52d0a31c607ccad826fee338575?from=afs-embedding-on",
+      "https://www.mercadopago.com.ar/activities/detail/purchase_v3-6456f477ae996c4f534a7959fb42004e79c19e64?from=afs-embedding-on",
+      "https://www.mercadopago.com.ar/activities/detail/purchase_v3-5c3f8b9970dd45561d4889c19e3954a3b10031be?from=afs-embedding-on"
     ]
   }
 }
