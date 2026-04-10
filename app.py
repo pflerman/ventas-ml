@@ -2152,9 +2152,32 @@ class VentasApp:
                     font=("TkDefaultFont", 9, "italic"),
                 ).pack(anchor="w")
 
-        # Margen de Andrés sobre su costo (= markup − 1). Va acá pegado al
-        # margen de Pablo para que se vean uno arriba del otro y sea fácil
-        # comparar la rentabilidad de los dos.
+        # Ganancia total de Andrés primero, luego margen con chip.
+        cobro_u = self._last_cobro_per_unit
+        pago_u = self._last_pago_per_unit
+        pack_mult = self._last_pack_mult or 1
+        if cobro_u is not None and pago_u is not None:
+            try:
+                qty = int((info or {}).get("quantity") or 1)
+            except (TypeError, ValueError):
+                qty = 1
+            gan_andres_total = (cobro_u - pago_u) * pack_mult * qty
+            row_ga = ttk.Frame(frame)
+            row_ga.pack(fill="x", anchor="w", pady=(8, 0))
+            tk.Label(
+                row_ga,
+                text="Ganancia Total Andrés →",
+                foreground="#7d3c98",
+                font=("TkDefaultFont", 12, "bold"),
+            ).pack(side="left")
+            tk.Label(
+                row_ga,
+                text=format_price(gan_andres_total),
+                foreground="#7d3c98",
+                font=("TkDefaultFont", 12, "bold", "underline"),
+            ).pack(side="right")
+
+        # Margen de Andrés sobre su costo (= markup − 1).
         sku = (info or {}).get("sku") if info else None
         markup_a = local_store.get_markup(sku) if sku else None
         if markup_a is None:
@@ -2196,32 +2219,6 @@ class VentasApp:
                 foreground="#888",
                 font=("TkDefaultFont", 9, "italic"),
             ).pack(anchor="w", pady=(1, 0))
-
-        # Ganancia total de Andrés (repetida acá abajo para tenerla a la vista
-        # junto con la ganancia de Pablo).
-        cobro_u = self._last_cobro_per_unit
-        pago_u = self._last_pago_per_unit
-        pack_mult = self._last_pack_mult or 1
-        if cobro_u is not None and pago_u is not None:
-            try:
-                qty = int((info or {}).get("quantity") or 1)
-            except (TypeError, ValueError):
-                qty = 1
-            gan_andres_total = (cobro_u - pago_u) * pack_mult * qty
-            row_ga = ttk.Frame(frame)
-            row_ga.pack(fill="x", anchor="w", pady=(8, 0))
-            tk.Label(
-                row_ga,
-                text="Ganancia Total Andrés →",
-                foreground="#7d3c98",
-                font=("TkDefaultFont", 12, "bold"),
-            ).pack(side="left")
-            tk.Label(
-                row_ga,
-                text=format_price(gan_andres_total),
-                foreground="#7d3c98",
-                font=("TkDefaultFont", 12, "bold", "underline"),
-            ).pack(side="right")
 
     # ────────────── Notas por venta ──────────────
 
