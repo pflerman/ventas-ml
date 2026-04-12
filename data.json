@@ -315,5 +315,15 @@
       "https://www.mercadopago.com.ar/activities/detail/purchase_v3-6456f477ae996c4f534a7959fb42004e79c19e64?from=afs-embedding-on",
       "https://www.mercadopago.com.ar/activities/detail/purchase_v3-5c3f8b9970dd45561d4889c19e3954a3b10031be?from=afs-embedding-on"
     ]
+  },
+  "fob_combo": {
+    "GP-0JQ8Q4G1": {
+      "items": [
+        {
+          "desc": "Bolsa 80x60",
+          "precio": 0.4
+        }
+      ]
+    }
   }
 }

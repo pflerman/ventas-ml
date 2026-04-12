@@ -33,6 +33,7 @@ _data: dict = {
     "checks": [],
     "notas": {},
     "fob": {},
+    "fob_combo": {},
     "etiquetas_catalogo": [],
     "etiquetas_por_sku": {},
     "neto_manual": {},
@@ -120,7 +121,51 @@ def set_check(order_id: str, checked: bool) -> None:
 
 # ────────────────────── FOB / multiplicador ──────────────────────
 
+
+def _fob_entry(sku: str) -> dict | None:
+    """Devuelve el dict de FOB para un SKU, sea individual o combo."""
+    if not sku:
+        return None
+    return _data["fob"].get(sku) or _data.get("fob_combo", {}).get(sku) or None
+
+
+def is_combo(sku: str) -> bool:
+    """True si el SKU tiene FOBs de combo configurados."""
+    if not sku:
+        return False
+    return sku in _data.get("fob_combo", {})
+
+
 def get_fob(sku: str) -> float | None:
+    """Devuelve el FOB por unidad. Para combos, devuelve la suma de los items."""
+    if not sku:
+        return None
+    # Combo tiene prioridad si existe
+    combo_entry = _data.get("fob_combo", {}).get(sku)
+    if combo_entry:
+        items = combo_entry.get("items") or []
+        if not items:
+            return None
+        try:
+            total = sum(
+                float(it.get("precio") or 0) * int(it.get("cant") or 1)
+                for it in items
+            )
+            return total or None
+        except (TypeError, ValueError):
+            return None
+    # Individual
+    entry = _data["fob"].get(sku)
+    if not entry:
+        return None
+    try:
+        return float(entry.get("precio") or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def get_fob_individual(sku: str) -> float | None:
+    """Devuelve solo el FOB individual (ignora combos)."""
     if not sku:
         return None
     entry = _data["fob"].get(sku)
@@ -133,9 +178,12 @@ def get_fob(sku: str) -> float | None:
 
 
 def set_fob(sku: str, precio_fob: float) -> None:
-    """Si precio_fob es 0/None, borra el FOB y el multiplicador del SKU."""
+    """Si precio_fob es 0/None, borra el FOB y el multiplicador del SKU.
+    Si el SKU era combo, borra el combo y lo pasa a individual."""
     if not sku:
         raise ValueError("SKU vacío")
+    # Si estaba como combo, borrar la entrada combo
+    _data.get("fob_combo", {}).pop(sku, None)
     if precio_fob is None or precio_fob <= 0:
         _data["fob"].pop(sku, None)
         _save()
@@ -145,10 +193,55 @@ def set_fob(sku: str, precio_fob: float) -> None:
     _save()
 
 
+def get_fob_combo_items(sku: str) -> list[dict] | None:
+    """Devuelve la lista de items del combo [{desc, precio}, ...] o None."""
+    if not sku:
+        return None
+    combo_entry = _data.get("fob_combo", {}).get(sku)
+    if not combo_entry:
+        return None
+    return list(combo_entry.get("items") or [])
+
+
+def set_fob_combo(sku: str, items: list[dict]) -> None:
+    """Guarda FOBs de combo para un SKU. items = [{desc, precio}, ...].
+    Si items está vacío, borra el combo. Si el SKU era individual, migra
+    mult y markup al combo."""
+    if not sku:
+        raise ValueError("SKU vacío")
+    if not items:
+        _data.get("fob_combo", {}).pop(sku, None)
+        _save()
+        return
+    # Migrar mult/markup del individual si existían
+    old_individual = _data["fob"].pop(sku, None)
+    combo = _data.setdefault("fob_combo", {}).setdefault(sku, {})
+    combo["items"] = [
+        {
+            "desc": (it.get("desc") or "").strip(),
+            "precio": float(it.get("precio") or 0),
+            "cant": max(1, int(it.get("cant") or 1)),
+        }
+        for it in items
+        if float(it.get("precio") or 0) > 0
+    ]
+    if not combo["items"]:
+        _data["fob_combo"].pop(sku, None)
+        _save()
+        return
+    # Preservar mult y markup si venían del individual
+    if old_individual:
+        if "mult" in old_individual:
+            combo["mult"] = old_individual["mult"]
+        if "markup" in old_individual:
+            combo["markup"] = old_individual["markup"]
+    _save()
+
+
 def get_multiplicador(sku: str) -> int | None:
     if not sku:
         return None
-    entry = _data["fob"].get(sku) or {}
+    entry = _fob_entry(sku) or {}
     val = entry.get("mult")
     if val is None:
         return None
@@ -159,13 +252,13 @@ def get_multiplicador(sku: str) -> int | None:
 
 
 def set_multiplicador(sku: str, valor: int) -> None:
-    """Requiere que ya exista FOB para ese SKU (mismo contrato que antes)."""
+    """Requiere que ya exista FOB (individual o combo) para ese SKU."""
     if not sku:
         raise ValueError("SKU vacío")
     if valor is None or valor < 1:
         raise ValueError("El multiplicador debe ser un entero ≥ 1")
-    entry = _data["fob"].get(sku)
-    if not entry or not entry.get("precio"):
+    entry = _fob_entry(sku)
+    if not entry:
         raise ValueError(
             f"No hay precio FOB cargado para {sku}. Cargá el FOB primero."
         )
@@ -178,7 +271,7 @@ def get_markup(sku: str) -> float | None:
     GANANCIA_HERMANO_MULT en el caller)."""
     if not sku:
         return None
-    entry = _data["fob"].get(sku) or {}
+    entry = _fob_entry(sku) or {}
     val = entry.get("markup")
     if val is None:
         return None
@@ -193,8 +286,8 @@ def set_markup(sku: str, valor: float | None) -> None:
     override (vuelve al default). Requiere que ya exista FOB."""
     if not sku:
         raise ValueError("SKU vacío")
-    entry = _data["fob"].get(sku)
-    if not entry or not entry.get("precio"):
+    entry = _fob_entry(sku)
+    if not entry:
         raise ValueError(
             f"No hay precio FOB cargado para {sku}. Cargá el FOB primero."
         )

@@ -10,7 +10,7 @@ import tkinter as tk
 import unicodedata
 import webbrowser
 import calendar as _calendar
-from datetime import datetime, date
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 from tkinter import filedialog, font as tkfont
 from tkinter import messagebox, ttk
@@ -68,11 +68,15 @@ def fetch_orders(auth: MLAuth, offset: int = 0, limit: int = PAGE_SIZE) -> dict:
         return json.loads(resp.read().decode("utf-8"))
 
 
+_TZ_AR = timezone(timedelta(hours=-3))
+
+
 def parse_iso(iso: str):
     if not iso:
         return None
     try:
-        return datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+        return dt.astimezone(_TZ_AR)
     except ValueError:
         return None
 
@@ -2305,6 +2309,52 @@ class VentasApp:
             ).pack(anchor="w")
             return
 
+        # ── Desglose combo (si aplica) ──
+        if local_store.is_combo(sku):
+            combo_items = local_store.get_fob_combo_items(sku) or []
+            combo_header = tk.Label(
+                frame,
+                text="📦 COMBO",
+                foreground="white",
+                background="#2980b9",
+                font=("TkDefaultFont", 9, "bold"),
+            )
+            combo_header.pack(anchor="w", pady=(0, 4))
+            for ci in combo_items:
+                ci_row = ttk.Frame(frame)
+                ci_row.pack(fill="x", anchor="w", pady=1)
+                desc = ci.get("desc") or "(sin descripción)"
+                precio = float(ci.get("precio") or 0)
+                cant = int(ci.get("cant") or 1)
+                cant_prefix = f"{cant}× " if cant > 1 else "  "
+                subtotal = precio * cant
+                ttk.Label(
+                    ci_row, text=f"  {cant_prefix}{desc}",
+                    font=("TkDefaultFont", 9),
+                    foreground="#555",
+                ).pack(side="left")
+                price_text = f"USD {precio:,.2f}" if cant == 1 else f"{cant}×{precio:,.2f} = USD {subtotal:,.2f}"
+                tk.Label(
+                    ci_row, text=price_text,
+                    foreground="#1a3a5c",
+                    font=("TkDefaultFont", 9),
+                ).pack(side="right")
+            # Línea de total combo
+            sep_combo = ttk.Frame(frame)
+            sep_combo.pack(fill="x", anchor="w", pady=(2, 2))
+            ttk.Separator(sep_combo, orient="horizontal").pack(fill="x")
+            total_row = ttk.Frame(frame)
+            total_row.pack(fill="x", anchor="w", pady=(0, 4))
+            ttk.Label(
+                total_row, text="  FOB combo total",
+                font=("TkDefaultFont", 10, "bold"),
+            ).pack(side="left")
+            tk.Label(
+                total_row, text=f"USD {fob:,.2f}",
+                foreground="#1a3a5c",
+                font=("TkDefaultFont", 10, "bold"),
+            ).pack(side="right")
+
         mult = local_store.get_multiplicador(sku)
         if mult is None:
             # FOB cargado pero falta el multiplicador → no se puede calcular nada.
@@ -2389,8 +2439,10 @@ class VentasApp:
         self._last_pack_mult = mult
 
         # ── Render: paso a paso, per-unidad ──
+        _is_combo = local_store.is_combo(sku)
+        fob_label = "FOB combo" if _is_combo else "FOB unitario"
         rows_unit = [
-            ("FOB unitario", f"USD {fob:,.2f}", "#1a3a5c"),
+            (fob_label, f"USD {fob:,.2f}", "#1a3a5c"),
             (f"Nacionalizado (×{NACIONALIZACION_MULT})",
              f"USD {nac_usd_unit:,.2f}", "#1a3a5c"),
         ]
@@ -2830,22 +2882,126 @@ class VentasApp:
             anchor="w", pady=(0, 12)
         )
 
-        ttk.Label(frame, text="Precio FOB (USD):").pack(anchor="w")
-        actual = local_store.get_fob(sku)
-        fob_var = tk.StringVar(value=f"{actual:.2f}" if actual else "")
-        entry = ttk.Entry(frame, textvariable=fob_var, width=20)
-        entry.pack(anchor="w", pady=(2, 12))
-        entry.focus_set()
-        entry.select_range(0, "end")
+        notebook = ttk.Notebook(frame)
+        notebook.pack(fill="both", expand=True, pady=(0, 8))
 
-        hint = ttk.Label(
-            frame,
+        # ── Solapa Individual ──
+        tab_individual = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_individual, text="Individual")
+
+        ttk.Label(tab_individual, text="Precio FOB (USD):").pack(anchor="w")
+        actual_individual = local_store.get_fob_individual(sku)
+        fob_var = tk.StringVar(value=f"{actual_individual:.2f}" if actual_individual else "")
+        entry_ind = ttk.Entry(tab_individual, textvariable=fob_var, width=20)
+        entry_ind.pack(anchor="w", pady=(2, 12))
+
+        ttk.Label(
+            tab_individual,
             text="Dejar vacío o 0 para borrar el FOB cargado.",
             foreground="#888",
             font=("TkDefaultFont", 9, "italic"),
-        )
-        hint.pack(anchor="w", pady=(0, 8))
+        ).pack(anchor="w", pady=(0, 4))
 
+        # ── Solapa Combo ──
+        tab_combo = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_combo, text="Combo")
+
+        ttk.Label(
+            tab_combo,
+            text="Componentes del combo (descripción + FOB en USD):",
+            font=("TkDefaultFont", 9),
+        ).pack(anchor="w", pady=(0, 8))
+
+        combo_items_frame = ttk.Frame(tab_combo)
+        combo_items_frame.pack(fill="x", anchor="w")
+
+        combo_rows: list[dict] = []
+        existing_combo = local_store.get_fob_combo_items(sku) or []
+
+        def _add_combo_row(desc: str = "", precio: float = 0.0, cant: int = 1):
+            row_frame = ttk.Frame(combo_items_frame)
+            row_frame.pack(fill="x", anchor="w", pady=2)
+            cant_var = tk.StringVar(value=str(cant))
+            desc_var = tk.StringVar(value=desc)
+            precio_var = tk.StringVar(value=f"{precio:.2f}" if precio else "")
+            ttk.Entry(row_frame, textvariable=cant_var, width=3).pack(
+                side="left", padx=(0, 2)
+            )
+            ttk.Label(row_frame, text="×").pack(side="left")
+            ttk.Entry(row_frame, textvariable=desc_var, width=22).pack(
+                side="left", padx=(2, 4)
+            )
+            ttk.Label(row_frame, text="USD").pack(side="left")
+            ttk.Entry(row_frame, textvariable=precio_var, width=10).pack(
+                side="left", padx=(2, 4)
+            )
+            row_data = {
+                "frame": row_frame,
+                "desc_var": desc_var,
+                "precio_var": precio_var,
+                "cant_var": cant_var,
+            }
+
+            def _remove():
+                row_frame.destroy()
+                combo_rows.remove(row_data)
+                _update_combo_total()
+
+            ttk.Button(row_frame, text="✕", width=2, command=_remove).pack(
+                side="left"
+            )
+            combo_rows.append(row_data)
+            precio_var.trace_add("write", lambda *_: _update_combo_total())
+            cant_var.trace_add("write", lambda *_: _update_combo_total())
+            return row_data
+
+        combo_total_var = tk.StringVar(value="Total: USD 0.00")
+        combo_total_lbl = tk.Label(
+            tab_combo,
+            textvariable=combo_total_var,
+            foreground="#1a3a5c",
+            font=("TkDefaultFont", 10, "bold"),
+        )
+
+        def _update_combo_total():
+            total = 0.0
+            for r in combo_rows:
+                raw_p = r["precio_var"].get().strip().replace(",", ".")
+                raw_c = r["cant_var"].get().strip()
+                try:
+                    precio = float(raw_p)
+                    cant = max(1, int(raw_c)) if raw_c else 1
+                    if precio > 0:
+                        total += precio * cant
+                except (ValueError, TypeError):
+                    pass
+            combo_total_var.set(f"Total: USD {total:,.2f}")
+
+        for ci in existing_combo:
+            _add_combo_row(
+                ci.get("desc") or "",
+                float(ci.get("precio") or 0),
+                int(ci.get("cant") or 1),
+            )
+
+        btn_add_row = ttk.Button(
+            tab_combo,
+            text="+ Agregar componente",
+            command=lambda: (_add_combo_row(), _update_combo_total()),
+        )
+        btn_add_row.pack(anchor="w", pady=(8, 4))
+        combo_total_lbl.pack(anchor="e", pady=(4, 0))
+        _update_combo_total()
+
+        # Seleccionar la solapa correcta
+        if local_store.is_combo(sku):
+            notebook.select(tab_combo)
+        else:
+            notebook.select(tab_individual)
+            entry_ind.focus_set()
+            entry_ind.select_range(0, "end")
+
+        # ── Botones ──
         btns = ttk.Frame(frame)
         btns.pack(fill="x")
 
@@ -2855,29 +3011,62 @@ class VentasApp:
         cancel_btn.pack(side="right", padx=(0, 6))
 
         def do_save():
-            raw = fob_var.get().strip().replace(",", ".")
-            if raw == "":
-                new_fob = 0.0
-            else:
+            selected_tab = notebook.index(notebook.select())
+            if selected_tab == 0:
+                # Individual
+                raw = fob_var.get().strip().replace(",", ".")
+                if raw == "":
+                    new_fob = 0.0
+                else:
+                    try:
+                        new_fob = float(raw)
+                    except ValueError:
+                        self._flash_status("Valor inválido — debe ser un número")
+                        return
+                    if new_fob < 0:
+                        self._flash_status("El FOB no puede ser negativo")
+                        return
                 try:
-                    new_fob = float(raw)
-                except ValueError:
-                    self._flash_status("Valor inválido — debe ser un número")
+                    local_store.set_fob(sku, new_fob)
+                except Exception as e:
+                    messagebox.showerror(
+                        "Error", f"No se pudo guardar el FOB:\n{e}", parent=win
+                    )
                     return
-                if new_fob < 0:
-                    self._flash_status("El FOB no puede ser negativo")
+            else:
+                # Combo
+                items = []
+                for r in combo_rows:
+                    desc = r["desc_var"].get().strip()
+                    raw_p = r["precio_var"].get().strip().replace(",", ".")
+                    raw_c = r["cant_var"].get().strip()
+                    if not raw_p:
+                        continue
+                    try:
+                        precio = float(raw_p)
+                    except ValueError:
+                        self._flash_status(f"Precio inválido en '{desc or '?'}'")
+                        return
+                    if precio < 0:
+                        self._flash_status("Los precios no pueden ser negativos")
+                        return
+                    try:
+                        cant = max(1, int(raw_c)) if raw_c else 1
+                    except ValueError:
+                        self._flash_status(f"Cantidad inválida en '{desc or '?'}'")
+                        return
+                    if precio > 0:
+                        items.append({"desc": desc, "precio": precio, "cant": cant})
+                try:
+                    local_store.set_fob_combo(sku, items)
+                except Exception as e:
+                    messagebox.showerror(
+                        "Error", f"No se pudo guardar el combo:\n{e}", parent=win
+                    )
                     return
-            try:
-                local_store.set_fob(sku, new_fob)
-            except Exception as e:
-                messagebox.showerror(
-                    "Error", f"No se pudo guardar el FOB:\n{e}", parent=win
-                )
-                return
             self._on_fob_saved(win, sku)
 
         save_btn.configure(command=do_save)
-        entry.bind("<Return>", lambda e: do_save())
         win.bind("<Return>", lambda e: do_save())
         win.bind("<KP_Enter>", lambda e: do_save())
         win.bind("<Escape>", lambda e: win.destroy())
