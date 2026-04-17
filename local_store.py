@@ -1,93 +1,159 @@
-"""Persistencia local en JSON. Reemplaza Turso + ventas_db + productos_lookup.
+"""Persistencia en PostgreSQL remoto (Hetzner VPS) con cache en memoria.
 
-Todo vive en `data.json` al lado del proyecto. Es 100% local, sync, sin
-dependencias externas. Para esta escala (cientos a miles de ventas) la
-escritura completa del JSON es instantánea.
+Al arrancar, carga todo en memoria (bulk SELECT). Las lecturas son
+instantáneas (dict lookup). Las escrituras van a memoria + DB.
+Para sincronizar entre máquinas, reiniciar la app (recarga desde DB).
 
-Estructura del JSON:
-{
-    "checks":             ["order_id1", ...],            # ventas marcadas
-    "notas":              {"order_id": "texto"},         # nota libre por venta
-    "fob":                {"SKU": {"precio": 12.5, "mult": 1, "markup": 1.4}},
-    "etiquetas_catalogo": ["ordenador", "blanco", ...],  # valores permitidos
-    "etiquetas_por_sku":  {"SKU": ["ordenador", ...]},   # asignaciones
-    "neto_manual":        {"order_id": 12345.67},        # neto MP cargado a mano
-    "shipping_manual":    {"order_id": 6500.00},         # costo Flex que paga el seller
-    "consolidados":       [{"id": "...", "fecha_creacion": "2026-04-09", ...}],
-    "liquidacion_links":  {"2026-05-07": ["https://...", "https://..."]}  # links MP por día
-}
-
-Patrón de uso:
-- init() una vez al arrancar (sync, instantáneo).
-- get/set/has/count para todo lo demás. Cada set escribe el JSON entero a
-  disco de forma atómica (tmp + rename). No hace falta thread.
+Conexión configurada por variable de entorno DATABASE_URL o por default
+al VPS de PaliShopping.
 """
-import json
 import os
-import tempfile
-from pathlib import Path
+import uuid as _uuid
 
-DATA_PATH = Path(__file__).parent / "data.json"
+import psycopg2
 
-_data: dict = {
-    "checks": [],
-    "notas": {},
-    "fob": {},
-    "fob_combo": {},
-    "etiquetas_catalogo": [],
-    "etiquetas_por_sku": {},
-    "neto_manual": {},
-    "shipping_manual": {},
-    "consolidados": [],
-    "liquidacion_links": {},
-}
-_checks_set: set[str] = set()
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql://pali:eacYsPU17bcNAIgOAwjOzHCp@5.78.197.139:5432/ventas_ml",
+)
+
+_conn = None
 _loaded = False
 
+# ── Cache en memoria (se carga en init()) ──
+_checks_set: set[str] = set()
+_notas: dict[str, str] = {}
+_fob: dict[str, dict] = {}          # {sku: {precio, mult, markup}}
+_fob_combo: dict[str, dict] = {}    # {sku: {items: [...], mult, markup}}
+_etiquetas_cat: list[str] = []
+_etiquetas_sku: dict[str, list[str]] = {}
+_neto_manual: dict[str, float] = {}
+_shipping_manual: dict[str, float] = {}
+_consolidados: list[dict] = []
+_liquidacion_links: dict[str, list[str]] = {}
 
-# ────────────────────── Carga / guardado ──────────────────────
+
+# ────────────────────── Conexión ──────────────────────
+
+def _get_conn():
+    global _conn
+    if _conn is None or _conn.closed:
+        _conn = psycopg2.connect(DATABASE_URL)
+        _conn.autocommit = True
+    return _conn
+
+
+def _q(sql, params=None, fetch=None):
+    """Ejecuta una query. fetch='one'|'all'|None."""
+    conn = _get_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            if fetch == "one":
+                return cur.fetchone()
+            elif fetch == "all":
+                return cur.fetchall()
+            return None
+    except psycopg2.OperationalError:
+        global _conn
+        _conn = None
+        conn = _get_conn()
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            if fetch == "one":
+                return cur.fetchone()
+            elif fetch == "all":
+                return cur.fetchall()
+            return None
+
+
+# ────────────────────── Carga inicial ──────────────────────
 
 def init() -> None:
-    """Carga el JSON desde disco. Si no existe, lo crea vacío."""
-    global _data, _checks_set, _loaded
-    if DATA_PATH.exists():
-        try:
-            with DATA_PATH.open("r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            # Mergear con defaults para tolerar JSONs viejos a los que les
-            # falten claves nuevas.
-            for k, v in _data.items():
-                loaded.setdefault(k, v if not isinstance(v, (dict, list)) else type(v)())
-            _data = loaded
-        except (OSError, json.JSONDecodeError):
-            # JSON corrupto: arrancamos vacío. No pisamos el archivo todavía,
-            # se sobrescribe en el primer save().
-            pass
-    _checks_set = set(_data.get("checks") or [])
+    """Carga todo desde PostgreSQL a memoria."""
+    global _loaded, _checks_set, _notas, _fob, _fob_combo
+    global _etiquetas_cat, _etiquetas_sku, _neto_manual, _shipping_manual
+    global _consolidados, _liquidacion_links
+
+    _get_conn()
+
+    # Checks
+    rows = _q("SELECT order_id FROM checks", fetch="all") or []
+    _checks_set = {r[0] for r in rows}
+
+    # Notas
+    rows = _q("SELECT order_id, nota FROM notas", fetch="all") or []
+    _notas = {r[0]: r[1] for r in rows}
+
+    # FOB individual
+    rows = _q("SELECT sku, precio, mult, markup FROM fob", fetch="all") or []
+    _fob = {}
+    for r in rows:
+        _fob[r[0]] = {"precio": r[1], "mult": r[2], "markup": r[3]}
+
+    # FOB combo
+    rows = _q("SELECT sku, mult, markup FROM fob_combo", fetch="all") or []
+    _fob_combo = {}
+    for r in rows:
+        _fob_combo[r[0]] = {"mult": r[1], "markup": r[2], "items": []}
+    if _fob_combo:
+        items = _q(
+            "SELECT sku, descripcion, precio, cant FROM fob_combo_items ORDER BY id",
+            fetch="all"
+        ) or []
+        for r in items:
+            if r[0] in _fob_combo:
+                _fob_combo[r[0]]["items"].append(
+                    {"desc": r[1], "precio": r[2], "cant": r[3]}
+                )
+
+    # Etiquetas catálogo
+    rows = _q("SELECT etiqueta FROM etiquetas_catalogo ORDER BY etiqueta",
+              fetch="all") or []
+    _etiquetas_cat = [r[0] for r in rows]
+
+    # Etiquetas por SKU
+    rows = _q("SELECT sku, etiqueta FROM etiquetas_por_sku", fetch="all") or []
+    _etiquetas_sku = {}
+    for r in rows:
+        _etiquetas_sku.setdefault(r[0], []).append(r[1])
+
+    # Neto manual
+    rows = _q("SELECT order_id, neto FROM neto_manual", fetch="all") or []
+    _neto_manual = {r[0]: float(r[1]) for r in rows}
+
+    # Shipping manual
+    rows = _q("SELECT order_id, costo FROM shipping_manual", fetch="all") or []
+    _shipping_manual = {r[0]: float(r[1]) for r in rows}
+
+    # Consolidados
+    rows = _q("""SELECT id, fecha_creacion, fecha_desde, fecha_hasta, fecha_pago,
+                        monto_deuda, credito, activo, facturado, nota
+                 FROM consolidados ORDER BY id""", fetch="all") or []
+    _consolidados = [
+        {
+            "id": r[0], "fecha_creacion": r[1] or "", "fecha_desde": r[2] or "",
+            "fecha_hasta": r[3] or "", "fecha_pago": r[4] or "",
+            "monto_deuda": r[5] or 0, "credito": r[6] or 0,
+            "activo": r[7] if r[7] is not None else True,
+            "facturado": r[8] if r[8] is not None else False,
+            "nota": r[9] or "",
+        }
+        for r in rows
+    ]
+
+    # Liquidación links
+    rows = _q("SELECT fecha, link FROM liquidacion_links ORDER BY id",
+              fetch="all") or []
+    _liquidacion_links = {}
+    for r in rows:
+        _liquidacion_links.setdefault(r[0], []).append(r[1])
+
     _loaded = True
 
 
 def loaded() -> bool:
     return _loaded
-
-
-def _save() -> None:
-    """Escribe el JSON entero a disco de forma atómica."""
-    # Sincronizamos checks (set) → lista para serializar.
-    _data["checks"] = sorted(_checks_set)
-    fd, tmp_path = tempfile.mkstemp(
-        prefix="data.", suffix=".tmp", dir=str(DATA_PATH.parent)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(_data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp_path, DATA_PATH)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
 
 
 # ────────────────────── Checks ──────────────────────
@@ -105,45 +171,46 @@ def count_checked() -> int:
 
 
 def set_check(order_id: str, checked: bool) -> None:
-    """Marca/desmarca y persiste."""
     if not order_id:
         return
     if checked:
         if order_id in _checks_set:
             return
         _checks_set.add(order_id)
+        _q("INSERT INTO checks (order_id) VALUES (%s) ON CONFLICT DO NOTHING",
+           (order_id,))
     else:
         if order_id not in _checks_set:
             return
         _checks_set.discard(order_id)
-    _save()
+        _q("DELETE FROM checks WHERE order_id = %s", (order_id,))
 
 
 # ────────────────────── FOB / multiplicador ──────────────────────
 
-
 def _fob_entry(sku: str) -> dict | None:
-    """Devuelve el dict de FOB para un SKU, sea individual o combo."""
     if not sku:
         return None
-    return _data["fob"].get(sku) or _data.get("fob_combo", {}).get(sku) or None
+    if sku in _fob_combo:
+        return _fob_combo[sku]
+    if sku in _fob:
+        return _fob[sku]
+    return None
 
 
 def is_combo(sku: str) -> bool:
-    """True si el SKU tiene FOBs de combo configurados."""
     if not sku:
         return False
-    return sku in _data.get("fob_combo", {})
+    return sku in _fob_combo
 
 
 def get_fob(sku: str) -> float | None:
-    """Devuelve el FOB por unidad. Para combos, devuelve la suma de los items."""
     if not sku:
         return None
-    # Combo tiene prioridad si existe
-    combo_entry = _data.get("fob_combo", {}).get(sku)
-    if combo_entry:
-        items = combo_entry.get("items") or []
+    # Combo tiene prioridad
+    combo = _fob_combo.get(sku)
+    if combo:
+        items = combo.get("items") or []
         if not items:
             return None
         try:
@@ -155,7 +222,7 @@ def get_fob(sku: str) -> float | None:
         except (TypeError, ValueError):
             return None
     # Individual
-    entry = _data["fob"].get(sku)
+    entry = _fob.get(sku)
     if not entry:
         return None
     try:
@@ -165,10 +232,9 @@ def get_fob(sku: str) -> float | None:
 
 
 def get_fob_individual(sku: str) -> float | None:
-    """Devuelve solo el FOB individual (ignora combos)."""
     if not sku:
         return None
-    entry = _data["fob"].get(sku)
+    entry = _fob.get(sku)
     if not entry:
         return None
     try:
@@ -178,45 +244,49 @@ def get_fob_individual(sku: str) -> float | None:
 
 
 def set_fob(sku: str, precio_fob: float) -> None:
-    """Si precio_fob es 0/None, borra el FOB y el multiplicador del SKU.
-    Si el SKU era combo, borra el combo y lo pasa a individual."""
     if not sku:
         raise ValueError("SKU vacío")
-    # Si estaba como combo, borrar la entrada combo
-    _data.get("fob_combo", {}).pop(sku, None)
+    # Si estaba como combo, borrar
+    if sku in _fob_combo:
+        del _fob_combo[sku]
+        _q("DELETE FROM fob_combo_items WHERE sku = %s", (sku,))
+        _q("DELETE FROM fob_combo WHERE sku = %s", (sku,))
     if precio_fob is None or precio_fob <= 0:
-        _data["fob"].pop(sku, None)
-        _save()
+        _fob.pop(sku, None)
+        _q("DELETE FROM fob WHERE sku = %s", (sku,))
         return
-    entry = _data["fob"].setdefault(sku, {})
+    entry = _fob.setdefault(sku, {})
     entry["precio"] = float(precio_fob)
-    _save()
+    _q("""INSERT INTO fob (sku, precio) VALUES (%s, %s)
+          ON CONFLICT (sku) DO UPDATE SET precio = EXCLUDED.precio""",
+       (sku, float(precio_fob)))
 
 
 def get_fob_combo_items(sku: str) -> list[dict] | None:
-    """Devuelve la lista de items del combo [{desc, precio}, ...] o None."""
     if not sku:
         return None
-    combo_entry = _data.get("fob_combo", {}).get(sku)
-    if not combo_entry:
+    combo = _fob_combo.get(sku)
+    if not combo:
         return None
-    return list(combo_entry.get("items") or [])
+    return list(combo.get("items") or [])
 
 
 def set_fob_combo(sku: str, items: list[dict]) -> None:
-    """Guarda FOBs de combo para un SKU. items = [{desc, precio}, ...].
-    Si items está vacío, borra el combo. Si el SKU era individual, migra
-    mult y markup al combo."""
     if not sku:
         raise ValueError("SKU vacío")
     if not items:
-        _data.get("fob_combo", {}).pop(sku, None)
-        _save()
+        _fob_combo.pop(sku, None)
+        _q("DELETE FROM fob_combo_items WHERE sku = %s", (sku,))
+        _q("DELETE FROM fob_combo WHERE sku = %s", (sku,))
         return
     # Migrar mult/markup del individual si existían
-    old_individual = _data["fob"].pop(sku, None)
-    combo = _data.setdefault("fob_combo", {}).setdefault(sku, {})
-    combo["items"] = [
+    old_individual = _fob.pop(sku, None)
+    old_mult = (old_individual or {}).get("mult")
+    old_markup = (old_individual or {}).get("markup")
+    if old_individual:
+        _q("DELETE FROM fob WHERE sku = %s", (sku,))
+
+    valid_items = [
         {
             "desc": (it.get("desc") or "").strip(),
             "precio": float(it.get("precio") or 0),
@@ -225,17 +295,31 @@ def set_fob_combo(sku: str, items: list[dict]) -> None:
         for it in items
         if float(it.get("precio") or 0) > 0
     ]
-    if not combo["items"]:
-        _data["fob_combo"].pop(sku, None)
-        _save()
+    if not valid_items:
+        _fob_combo.pop(sku, None)
+        _q("DELETE FROM fob_combo_items WHERE sku = %s", (sku,))
+        _q("DELETE FROM fob_combo WHERE sku = %s", (sku,))
         return
-    # Preservar mult y markup si venían del individual
-    if old_individual:
-        if "mult" in old_individual:
-            combo["mult"] = old_individual["mult"]
-        if "markup" in old_individual:
-            combo["markup"] = old_individual["markup"]
-    _save()
+
+    # Actualizar cache
+    combo = _fob_combo.setdefault(sku, {})
+    combo["items"] = valid_items
+    if old_mult is not None and "mult" not in combo:
+        combo["mult"] = old_mult
+    if old_markup is not None and "markup" not in combo:
+        combo["markup"] = old_markup
+
+    # Actualizar DB
+    _q("""INSERT INTO fob_combo (sku, mult, markup) VALUES (%s, %s, %s)
+          ON CONFLICT (sku) DO UPDATE SET
+            mult = COALESCE(fob_combo.mult, EXCLUDED.mult),
+            markup = COALESCE(fob_combo.markup, EXCLUDED.markup)""",
+       (sku, old_mult, old_markup))
+    _q("DELETE FROM fob_combo_items WHERE sku = %s", (sku,))
+    for it in valid_items:
+        _q("""INSERT INTO fob_combo_items (sku, descripcion, precio, cant)
+              VALUES (%s, %s, %s, %s)""",
+           (sku, it["desc"], it["precio"], it["cant"]))
 
 
 def get_multiplicador(sku: str) -> int | None:
@@ -252,7 +336,6 @@ def get_multiplicador(sku: str) -> int | None:
 
 
 def set_multiplicador(sku: str, valor: int) -> None:
-    """Requiere que ya exista FOB (individual o combo) para ese SKU."""
     if not sku:
         raise ValueError("SKU vacío")
     if valor is None or valor < 1:
@@ -263,12 +346,13 @@ def set_multiplicador(sku: str, valor: int) -> None:
             f"No hay precio FOB cargado para {sku}. Cargá el FOB primero."
         )
     entry["mult"] = int(valor)
-    _save()
+    if sku in _fob_combo:
+        _q("UPDATE fob_combo SET mult = %s WHERE sku = %s", (int(valor), sku))
+    else:
+        _q("UPDATE fob SET mult = %s WHERE sku = %s", (int(valor), sku))
 
 
 def get_markup(sku: str) -> float | None:
-    """Markup de Andrés para un SKU. None si no hay override (cae al default
-    GANANCIA_HERMANO_MULT en el caller)."""
     if not sku:
         return None
     entry = _fob_entry(sku) or {}
@@ -282,8 +366,6 @@ def get_markup(sku: str) -> float | None:
 
 
 def set_markup(sku: str, valor: float | None) -> None:
-    """Persiste el markup de Andrés para un SKU. Si valor es None, borra el
-    override (vuelve al default). Requiere que ya exista FOB."""
     if not sku:
         raise ValueError("SKU vacío")
     entry = _fob_entry(sku)
@@ -299,7 +381,11 @@ def set_markup(sku: str, valor: float | None) -> None:
         if valor < 1:
             raise ValueError("El markup debe ser ≥ 1")
         entry["markup"] = float(valor)
-    _save()
+    db_val = float(valor) if valor is not None else None
+    if sku in _fob_combo:
+        _q("UPDATE fob_combo SET markup = %s WHERE sku = %s", (db_val, sku))
+    else:
+        _q("UPDATE fob SET markup = %s WHERE sku = %s", (db_val, sku))
 
 
 # ────────────────────── Notas ──────────────────────
@@ -307,105 +393,107 @@ def set_markup(sku: str, valor: float | None) -> None:
 def get_nota(order_id: str) -> str:
     if not order_id:
         return ""
-    return _data["notas"].get(order_id, "")
+    return _notas.get(order_id, "")
 
 
 def has_nota(order_id: str) -> bool:
-    return bool(_data["notas"].get(order_id))
+    return bool(_notas.get(order_id))
 
 
 def count_with_nota() -> int:
-    return len(_data["notas"])
+    return len(_notas)
 
 
 def all_with_nota() -> set[str]:
-    return set(_data["notas"].keys())
+    return set(_notas.keys())
 
 
 def set_nota(order_id: str, nota: str) -> None:
-    """Si nota está vacía, borra la entrada."""
     if not order_id:
         return
     if nota:
-        if _data["notas"].get(order_id) == nota:
+        if _notas.get(order_id) == nota:
             return
-        _data["notas"][order_id] = nota
+        _notas[order_id] = nota
+        _q("""INSERT INTO notas (order_id, nota) VALUES (%s, %s)
+              ON CONFLICT (order_id) DO UPDATE SET nota = EXCLUDED.nota""",
+           (order_id, nota))
     else:
-        if order_id not in _data["notas"]:
+        if order_id not in _notas:
             return
-        _data["notas"].pop(order_id, None)
-    _save()
+        _notas.pop(order_id, None)
+        _q("DELETE FROM notas WHERE order_id = %s", (order_id,))
 
 
 # ────────────────────── Etiquetas ──────────────────────
 
 def etiquetas_catalogo() -> list[str]:
-    """Lista ordenada de etiquetas posibles (el catálogo)."""
-    return sorted(_data["etiquetas_catalogo"])
+    return sorted(_etiquetas_cat)
 
 
 def add_etiqueta_catalogo(etiqueta: str) -> bool:
-    """Agrega una etiqueta al catálogo. Devuelve True si era nueva."""
     et = (etiqueta or "").strip()
     if not et:
         return False
-    if et in _data["etiquetas_catalogo"]:
+    if et in _etiquetas_cat:
         return False
-    _data["etiquetas_catalogo"].append(et)
-    _save()
+    _etiquetas_cat.append(et)
+    _q("INSERT INTO etiquetas_catalogo (etiqueta) VALUES (%s) ON CONFLICT DO NOTHING",
+       (et,))
     return True
 
 
 def remove_etiqueta_catalogo(etiqueta: str) -> None:
-    """Borra del catálogo Y de todos los SKUs que la tengan asignada."""
-    if etiqueta not in _data["etiquetas_catalogo"]:
+    if etiqueta not in _etiquetas_cat:
         return
-    _data["etiquetas_catalogo"].remove(etiqueta)
-    for sku, ets in _data["etiquetas_por_sku"].items():
+    _etiquetas_cat.remove(etiqueta)
+    for sku, ets in _etiquetas_sku.items():
         if etiqueta in ets:
             ets.remove(etiqueta)
-    _save()
+    _q("DELETE FROM etiquetas_por_sku WHERE etiqueta = %s", (etiqueta,))
+    _q("DELETE FROM etiquetas_catalogo WHERE etiqueta = %s", (etiqueta,))
 
 
 def get_etiquetas_sku(sku: str) -> list[str]:
     if not sku:
         return []
-    return list(_data["etiquetas_por_sku"].get(sku) or [])
+    return list(_etiquetas_sku.get(sku) or [])
 
 
 def add_etiqueta_a_sku(sku: str, etiqueta: str) -> None:
-    """Asigna una etiqueta del catálogo a un SKU. Si la etiqueta no está en
-    el catálogo, la agrega también."""
     if not sku or not etiqueta:
         return
-    if etiqueta not in _data["etiquetas_catalogo"]:
-        _data["etiquetas_catalogo"].append(etiqueta)
-    ets = _data["etiquetas_por_sku"].setdefault(sku, [])
+    if etiqueta not in _etiquetas_cat:
+        _etiquetas_cat.append(etiqueta)
+        _q("INSERT INTO etiquetas_catalogo (etiqueta) VALUES (%s) ON CONFLICT DO NOTHING",
+           (etiqueta,))
+    ets = _etiquetas_sku.setdefault(sku, [])
     if etiqueta in ets:
         return
     ets.append(etiqueta)
-    _save()
+    _q("""INSERT INTO etiquetas_por_sku (sku, etiqueta) VALUES (%s, %s)
+          ON CONFLICT DO NOTHING""", (sku, etiqueta))
 
 
 def remove_etiqueta_de_sku(sku: str, etiqueta: str) -> None:
     if not sku or not etiqueta:
         return
-    ets = _data["etiquetas_por_sku"].get(sku)
+    ets = _etiquetas_sku.get(sku)
     if not ets or etiqueta not in ets:
         return
     ets.remove(etiqueta)
     if not ets:
-        _data["etiquetas_por_sku"].pop(sku, None)
-    _save()
+        _etiquetas_sku.pop(sku, None)
+    _q("DELETE FROM etiquetas_por_sku WHERE sku = %s AND etiqueta = %s",
+       (sku, etiqueta))
 
 
 # ────────────────────── Neto MP manual ──────────────────────
 
 def get_neto_manual(order_id: str) -> float | None:
-    """Devuelve el neto MP cargado a mano para una venta, o None si falta."""
     if not order_id:
         return None
-    val = _data["neto_manual"].get(order_id)
+    val = _neto_manual.get(order_id)
     if val is None:
         return None
     try:
@@ -415,31 +503,30 @@ def get_neto_manual(order_id: str) -> float | None:
 
 
 def set_neto_manual(order_id: str, neto: float | None) -> None:
-    """Persiste el neto. Si es None o 0, borra la entrada."""
     if not order_id:
         return
     if neto is None or neto == 0:
-        if order_id not in _data["neto_manual"]:
+        if order_id not in _neto_manual:
             return
-        _data["neto_manual"].pop(order_id, None)
+        _neto_manual.pop(order_id, None)
+        _q("DELETE FROM neto_manual WHERE order_id = %s", (order_id,))
     else:
-        _data["neto_manual"][order_id] = float(neto)
-    _save()
+        _neto_manual[order_id] = float(neto)
+        _q("""INSERT INTO neto_manual (order_id, neto) VALUES (%s, %s)
+              ON CONFLICT (order_id) DO UPDATE SET neto = EXCLUDED.neto""",
+           (order_id, float(neto)))
 
 
 def count_neto_manual() -> int:
-    return len(_data["neto_manual"])
+    return len(_neto_manual)
 
 
 # ────────────────────── Costo de envío manual (Flex) ──────────────────────
-# Costo del envío que el seller paga afuera (típicamente Flex con Héctor).
-# Si está cargado, se RESTA del neto MP para obtener el "neto efectivo" —
-# es plata que ya salió del bolsillo del seller después de cobrar a MP.
 
 def get_shipping_manual(order_id: str) -> float | None:
     if not order_id:
         return None
-    val = _data["shipping_manual"].get(order_id)
+    val = _shipping_manual.get(order_id)
     if val is None:
         return None
     try:
@@ -449,25 +536,25 @@ def get_shipping_manual(order_id: str) -> float | None:
 
 
 def set_shipping_manual(order_id: str, costo: float | None) -> None:
-    """Persiste el costo. Si es None o 0, borra la entrada."""
     if not order_id:
         return
     if costo is None or costo == 0:
-        if order_id not in _data["shipping_manual"]:
+        if order_id not in _shipping_manual:
             return
-        _data["shipping_manual"].pop(order_id, None)
+        _shipping_manual.pop(order_id, None)
+        _q("DELETE FROM shipping_manual WHERE order_id = %s", (order_id,))
     else:
-        _data["shipping_manual"][order_id] = float(costo)
-    _save()
+        _shipping_manual[order_id] = float(costo)
+        _q("""INSERT INTO shipping_manual (order_id, costo) VALUES (%s, %s)
+              ON CONFLICT (order_id) DO UPDATE SET costo = EXCLUDED.costo""",
+           (order_id, float(costo)))
 
 
 def count_shipping_manual() -> int:
-    return len(_data["shipping_manual"])
+    return len(_shipping_manual)
 
 
 def get_neto_efectivo(order_id: str) -> float | None:
-    """Neto MP menos costo de envío manual. Devuelve None si falta el neto.
-    Si no hay shipping cargado, devuelve el neto tal cual."""
     neto = get_neto_manual(order_id)
     if neto is None:
         return None
@@ -475,29 +562,13 @@ def get_neto_efectivo(order_id: str) -> float | None:
     return neto - shipping
 
 
-# ────────────────────── Consolidados (sección Consolidados) ──────────────────────
-# Lista de tarjetas independientes (no se vinculan con las ventas). Cada
-# tarjeta representa una consolidación de pago entre Pablo y Andrés:
-#   - fecha_creacion: cuándo se cargó (manual)
-#   - fecha_desde / fecha_hasta: rango de la mercadería que se está consolidando
-#   - fecha_pago: cuándo se paga (resaltado en la UI)
-#   - monto_deuda: lo que Pablo le debe a Andrés
-#   - credito: lo que Andrés le debe a Pablo (sueldo, devoluciones, etc.) → se resta
-#   - activo: si está vigente o ya cerrada
-#   - facturado: si Andrés ya facturó esa cantidad
-#   - nota: texto libre
-# Todo manual, no se infiere de ninguna otra parte de la app.
-
-import uuid as _uuid
-
+# ────────────────────── Consolidados ──────────────────────
 
 def list_consolidados() -> list[dict]:
-    """Devuelve una copia de la lista entera (en orden de inserción)."""
-    return [dict(c) for c in _data.get("consolidados", [])]
+    return [dict(c) for c in _consolidados]
 
 
 def add_consolidado(data: dict) -> str:
-    """Agrega una tarjeta nueva. Devuelve el id generado."""
     cid = _uuid.uuid4().hex[:10]
     entry = {
         "id": cid,
@@ -511,82 +582,99 @@ def add_consolidado(data: dict) -> str:
         "facturado": bool(data.get("facturado", False)),
         "nota": data.get("nota") or "",
     }
-    _data.setdefault("consolidados", []).append(entry)
-    _save()
+    _consolidados.append(entry)
+    _q("""INSERT INTO consolidados
+          (id, fecha_creacion, fecha_desde, fecha_hasta, fecha_pago,
+           monto_deuda, credito, activo, facturado, nota)
+          VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+       (cid, entry["fecha_creacion"], entry["fecha_desde"],
+        entry["fecha_hasta"], entry["fecha_pago"],
+        entry["monto_deuda"], entry["credito"],
+        entry["activo"], entry["facturado"], entry["nota"]))
     return cid
 
 
 def update_consolidado(cid: str, **fields) -> None:
-    """Actualiza campos de una tarjeta existente."""
     if not cid:
         return
-    for c in _data.get("consolidados", []):
+    # Actualizar cache
+    for c in _consolidados:
         if c.get("id") == cid:
+            sets = []
+            vals = []
             for k, v in fields.items():
                 if k == "id":
                     continue
                 if k in ("monto_deuda", "credito"):
                     c[k] = float(v or 0)
+                    sets.append(f"{k} = %s")
+                    vals.append(float(v or 0))
                 elif k in ("activo", "facturado"):
                     c[k] = bool(v)
+                    sets.append(f"{k} = %s")
+                    vals.append(bool(v))
                 else:
                     c[k] = v if v is not None else ""
-            _save()
+                    sets.append(f"{k} = %s")
+                    vals.append(v if v is not None else "")
+            if sets:
+                vals.append(cid)
+                _q(f"UPDATE consolidados SET {', '.join(sets)} WHERE id = %s", vals)
             return
 
 
 def delete_consolidado(cid: str) -> None:
     if not cid:
         return
-    cs = _data.get("consolidados", [])
-    new = [c for c in cs if c.get("id") != cid]
-    if len(new) != len(cs):
-        _data["consolidados"] = new
-        _save()
+    new = [c for c in _consolidados if c.get("id") != cid]
+    if len(new) != len(_consolidados):
+        _consolidados.clear()
+        _consolidados.extend(new)
+        _q("DELETE FROM consolidados WHERE id = %s", (cid,))
 
 
 def get_consolidado(cid: str) -> dict | None:
     if not cid:
         return None
-    for c in _data.get("consolidados", []):
+    for c in _consolidados:
         if c.get("id") == cid:
             return dict(c)
     return None
 
 
 # ────────────────────── Liquidación: links MP por día ──────────────────────
-# Diccionario {fecha_iso: [link1, link2, ...]}. fecha_iso es "YYYY-MM-DD".
-# Manual: el usuario pega un link en el día que quiere y se persiste.
 
 def get_links_dia(fecha: str) -> list[str]:
     if not fecha:
         return []
-    return list(_data.get("liquidacion_links", {}).get(fecha, []))
+    return list(_liquidacion_links.get(fecha, []))
 
 
 def add_link_dia(fecha: str, link: str) -> None:
     if not fecha or not link:
         return
-    d = _data.setdefault("liquidacion_links", {})
-    d.setdefault(fecha, []).append(link)
-    _save()
+    _liquidacion_links.setdefault(fecha, []).append(link)
+    _q("INSERT INTO liquidacion_links (fecha, link) VALUES (%s, %s)",
+       (fecha, link))
 
 
 def remove_link_dia(fecha: str, idx: int) -> None:
-    d = _data.get("liquidacion_links", {})
-    links = d.get(fecha)
+    links = _liquidacion_links.get(fecha)
     if not links or idx < 0 or idx >= len(links):
         return
     links.pop(idx)
     if not links:
-        d.pop(fecha, None)
-    _save()
+        _liquidacion_links.pop(fecha, None)
+    # En DB: borrar y reinsertar para mantener el orden
+    _q("DELETE FROM liquidacion_links WHERE fecha = %s", (fecha,))
+    for link in (links or []):
+        _q("INSERT INTO liquidacion_links (fecha, link) VALUES (%s, %s)",
+           (fecha, link))
 
 
 def dias_con_links() -> set[str]:
-    """Devuelve el set de fechas (ISO) que tienen al menos un link."""
-    return set(_data.get("liquidacion_links", {}).keys())
+    return set(_liquidacion_links.keys())
 
 
 def count_links_dia(fecha: str) -> int:
-    return len(_data.get("liquidacion_links", {}).get(fecha, []))
+    return len(_liquidacion_links.get(fecha, []))
