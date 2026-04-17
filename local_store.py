@@ -435,6 +435,11 @@ def set_costo_ars(sku: str, precio: float | None, mult: int | None = None) -> No
         _costo_ars.pop(sku, None)
         _q("DELETE FROM costo_ars WHERE sku = %s", (sku,))
         return
+    # Migrar multiplicador del FOB viejo si no se pasó uno explícito
+    if mult is None:
+        old_mult = get_multiplicador(sku)
+        if old_mult is not None:
+            mult = old_mult
     # Borrar FOB si existía (un SKU es o FOB o costo ARS, no ambos)
     if sku in _fob:
         del _fob[sku]
