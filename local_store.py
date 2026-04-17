@@ -29,7 +29,6 @@ _etiquetas_cat: list[str] = []
 _etiquetas_sku: dict[str, list[str]] = {}
 _neto_manual: dict[str, float] = {}
 _shipping_manual: dict[str, float] = {}
-_costo_ars: dict[str, dict] = {}   # {sku: {precio, mult}}
 _consolidados: list[dict] = []
 _liquidacion_links: dict[str, list[str]] = {}
 
@@ -72,7 +71,7 @@ def _q(sql, params=None, fetch=None):
 
 def init() -> None:
     """Carga todo desde PostgreSQL a memoria."""
-    global _loaded, _checks_set, _notas, _fob, _fob_combo, _costo_ars
+    global _loaded, _checks_set, _notas, _fob, _fob_combo
     global _etiquetas_cat, _etiquetas_sku, _neto_manual, _shipping_manual
     global _consolidados, _liquidacion_links
 
@@ -107,12 +106,6 @@ def init() -> None:
                 _fob_combo[r[0]]["items"].append(
                     {"desc": r[1], "precio": r[2], "cant": r[3]}
                 )
-
-    # Costo ARS (proveedor Cris)
-    rows = _q("SELECT sku, precio, mult FROM costo_ars", fetch="all") or []
-    _costo_ars = {}
-    for r in rows:
-        _costo_ars[r[0]] = {"precio": r[1], "mult": r[2]}
 
     # Etiquetas catálogo
     rows = _q("SELECT etiqueta FROM etiquetas_catalogo ORDER BY etiqueta",
@@ -393,78 +386,6 @@ def set_markup(sku: str, valor: float | None) -> None:
         _q("UPDATE fob_combo SET markup = %s WHERE sku = %s", (db_val, sku))
     else:
         _q("UPDATE fob SET markup = %s WHERE sku = %s", (db_val, sku))
-
-
-# ────────────────────── Costo ARS (proveedor Cris) ──────────────────────
-# Precio directo en pesos argentinos. Sin FOB, sin dólar, sin nacionalización,
-# sin markup. El precio es lo que Cris cobra por unidad.
-
-def get_costo_ars(sku: str) -> float | None:
-    if not sku:
-        return None
-    entry = _costo_ars.get(sku)
-    if not entry:
-        return None
-    try:
-        return float(entry.get("precio") or 0) or None
-    except (TypeError, ValueError):
-        return None
-
-
-def get_costo_ars_mult(sku: str) -> int | None:
-    if not sku:
-        return None
-    entry = _costo_ars.get(sku)
-    if not entry:
-        return None
-    val = entry.get("mult")
-    if val is None:
-        return None
-    try:
-        return int(val)
-    except (TypeError, ValueError):
-        return None
-
-
-def set_costo_ars(sku: str, precio: float | None, mult: int | None = None) -> None:
-    """Guarda el costo ARS. Si precio es None/0, borra la entrada.
-    Al setear costo_ars, borra FOB individual y combo si existían (son mutuamente excluyentes)."""
-    if not sku:
-        raise ValueError("SKU vacío")
-    if precio is None or precio <= 0:
-        _costo_ars.pop(sku, None)
-        _q("DELETE FROM costo_ars WHERE sku = %s", (sku,))
-        return
-    # Borrar FOB si existía (un SKU es o FOB o costo ARS, no ambos)
-    if sku in _fob:
-        del _fob[sku]
-        _q("DELETE FROM fob WHERE sku = %s", (sku,))
-    if sku in _fob_combo:
-        del _fob_combo[sku]
-        _q("DELETE FROM fob_combo_items WHERE sku = %s", (sku,))
-        _q("DELETE FROM fob_combo WHERE sku = %s", (sku,))
-    _costo_ars[sku] = {"precio": float(precio), "mult": int(mult) if mult else None}
-    _q("""INSERT INTO costo_ars (sku, precio, mult) VALUES (%s, %s, %s)
-          ON CONFLICT (sku) DO UPDATE SET precio = EXCLUDED.precio, mult = EXCLUDED.mult""",
-       (sku, float(precio), int(mult) if mult else None))
-
-
-def set_costo_ars_mult(sku: str, valor: int) -> None:
-    if not sku:
-        raise ValueError("SKU vacío")
-    if valor is None or valor < 1:
-        raise ValueError("El multiplicador debe ser un entero ≥ 1")
-    entry = _costo_ars.get(sku)
-    if not entry:
-        raise ValueError(f"No hay costo ARS cargado para {sku}.")
-    entry["mult"] = int(valor)
-    _q("UPDATE costo_ars SET mult = %s WHERE sku = %s", (int(valor), sku))
-
-
-def has_costo_ars(sku: str) -> bool:
-    if not sku:
-        return False
-    return sku in _costo_ars
 
 
 # ────────────────────── Notas ──────────────────────

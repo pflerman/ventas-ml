@@ -2182,49 +2182,47 @@ class VentasApp:
             ).pack(side="right")
 
         # Margen de Andrés sobre su costo (= markup − 1).
-        # Solo para productos de Andrés (no Cris).
         sku = (info or {}).get("sku") if info else None
-        if sku and not local_store.has_costo_ars(sku):
-            markup_a = local_store.get_markup(sku) if sku else None
-            if markup_a is None:
-                markup_a = GANANCIA_HERMANO_MULT
-            margen_a_pct = (markup_a - 1) * 100
-            chip_text_a, chip_bg_a = chip_for(margen_a_pct)
+        markup_a = local_store.get_markup(sku) if sku else None
+        if markup_a is None:
+            markup_a = GANANCIA_HERMANO_MULT
+        margen_a_pct = (markup_a - 1) * 100
+        chip_text_a, chip_bg_a = chip_for(margen_a_pct)
 
-            margen_a_row = ttk.Frame(frame)
-            margen_a_row.pack(fill="x", anchor="w", pady=(6, 0))
+        margen_a_row = ttk.Frame(frame)
+        margen_a_row.pack(fill="x", anchor="w", pady=(6, 0))
+        ttk.Label(
+            margen_a_row,
+            text="Margen Andrés",
+            font=("TkDefaultFont", 11, "bold"),
+        ).pack(side="left")
+        tk.Label(
+            margen_a_row,
+            text=f"{margen_a_pct:.1f}%",
+            foreground="#1a3a5c",
+            font=("TkDefaultFont", 12, "bold"),
+        ).pack(side="left", padx=(8, 8))
+        tk.Label(
+            margen_a_row,
+            text=f"  {chip_text_a}  ",
+            foreground="white",
+            background=chip_bg_a,
+            font=("TkDefaultFont", 9, "bold"),
+        ).pack(side="left")
+
+        # Sugerencia de markup para Andrés. Trivial: target_pct% → 1 + t/100.
+        partes_a = []
+        if margen_a_pct < 20:
+            partes_a.append("BUENO subí markup a 1.20")
+        if margen_a_pct < 30:
+            partes_a.append("EXCELENTE subí markup a 1.30")
+        if partes_a:
             ttk.Label(
-                margen_a_row,
-                text="Margen Andrés",
-                font=("TkDefaultFont", 11, "bold"),
-            ).pack(side="left")
-            tk.Label(
-                margen_a_row,
-                text=f"{margen_a_pct:.1f}%",
-                foreground="#1a3a5c",
-                font=("TkDefaultFont", 12, "bold"),
-            ).pack(side="left", padx=(8, 8))
-            tk.Label(
-                margen_a_row,
-                text=f"  {chip_text_a}  ",
-                foreground="white",
-                background=chip_bg_a,
-                font=("TkDefaultFont", 9, "bold"),
-            ).pack(side="left")
-
-            # Sugerencia de markup para Andrés. Trivial: target_pct% → 1 + t/100.
-            partes_a = []
-            if margen_a_pct < 20:
-                partes_a.append("BUENO subí markup a 1.20")
-            if margen_a_pct < 30:
-                partes_a.append("EXCELENTE subí markup a 1.30")
-            if partes_a:
-                ttk.Label(
-                    frame,
-                    text="Para " + "  ·  Para ".join(partes_a),
-                    foreground="#888",
-                    font=("TkDefaultFont", 9, "italic"),
-                ).pack(anchor="w", pady=(1, 0))
+                frame,
+                text="Para " + "  ·  Para ".join(partes_a),
+                foreground="#888",
+                font=("TkDefaultFont", 9, "italic"),
+            ).pack(anchor="w", pady=(1, 0))
 
     # ────────────── Notas por venta ──────────────
 
@@ -2296,18 +2294,11 @@ class VentasApp:
                 font=("TkDefaultFont", 9, "italic"),
             ).pack(anchor="w")
             return
-
-        # ── Costo ARS (proveedor Cris) ──
-        costo_ars = local_store.get_costo_ars(sku)
-        if costo_ars is not None:
-            self._render_costo_ars(frame, sku, costo_ars, info)
-            return
-
         fob = local_store.get_fob(sku)
         if not fob or fob <= 0:
             ttk.Label(
                 frame,
-                text="Sin precio cargado (FOB o ARS)",
+                text="Sin precio FOB cargado",
                 foreground="#888",
             ).pack(anchor="w")
             ttk.Label(
@@ -2641,102 +2632,6 @@ class VentasApp:
                 font=("TkDefaultFont", 12, "bold", "underline"),
             ).pack(side="right")
 
-    def _render_costo_ars(self, frame, sku: str, costo_ars: float, info: dict | None):
-        """Render simplificado para productos de Cris (costo directo en ARS)."""
-        # Chip "CRIS (ARS)"
-        tk.Label(
-            frame,
-            text=" CRIS (ARS) ",
-            foreground="white",
-            background="#27ae60",
-            font=("TkDefaultFont", 9, "bold"),
-        ).pack(anchor="w", pady=(0, 4))
-
-        mult = local_store.get_costo_ars_mult(sku)
-        if mult is None:
-            row = ttk.Frame(frame)
-            row.pack(fill="x", anchor="w", pady=1)
-            ttk.Label(row, text="Costo unitario", font=("TkDefaultFont", 10)).pack(side="left")
-            tk.Label(
-                row,
-                text=format_price(costo_ars),
-                foreground="#27ae60",
-                font=("TkDefaultFont", 10, "bold"),
-            ).pack(side="right")
-            ttk.Label(
-                frame,
-                text="⚠️ Falta multiplicador",
-                foreground="#d35400",
-                font=("TkDefaultFont", 10, "bold"),
-            ).pack(anchor="w", pady=(6, 0))
-            ttk.Label(
-                frame,
-                text="Alt+Click en la fila para cargarlo",
-                foreground="#888",
-                font=("TkDefaultFont", 9, "italic"),
-            ).pack(anchor="w")
-            return
-
-        costo_pack = costo_ars * mult
-        try:
-            quantity = int((info or {}).get("quantity") or 1)
-        except (TypeError, ValueError):
-            quantity = 1
-
-        # Costo unitario
-        row = ttk.Frame(frame)
-        row.pack(fill="x", anchor="w", pady=1)
-        ttk.Label(row, text="Costo unitario Cris", font=("TkDefaultFont", 10)).pack(side="left")
-        tk.Label(
-            row, text=format_price(costo_ars),
-            foreground="#27ae60", font=("TkDefaultFont", 10),
-        ).pack(side="right")
-
-        # Costo pack (si mult > 1)
-        if mult > 1:
-            row_pack = ttk.Frame(frame)
-            row_pack.pack(fill="x", anchor="w", pady=1)
-            ttk.Label(row_pack, text="Costo por pack", font=("TkDefaultFont", 10)).pack(side="left")
-            tk.Label(
-                row_pack,
-                text=f"  Pack {mult}  ",
-                foreground="white", background="#27ae60",
-                font=("TkDefaultFont", 9, "bold"),
-            ).pack(side="left", padx=(6, 0))
-            tk.Label(
-                row_pack, text=format_price(costo_pack),
-                foreground="#27ae60", font=("TkDefaultFont", 10),
-            ).pack(side="right")
-
-        # Pagar a Cris (destacado)
-        pagar_cris = costo_pack * quantity
-        row_total = tk.Frame(
-            frame, background="#e8f8f0",
-            highlightbackground="#27ae60", highlightthickness=2,
-            padx=6, pady=4,
-        )
-        row_total.pack(fill="x", anchor="w", pady=(4, 1))
-        label_text = "Pagar a Cris:"
-        if quantity > 1:
-            label_text = f"Pagar a Cris (×{quantity}):"
-        tk.Label(
-            row_total, text=label_text,
-            foreground="#27ae60", background="#e8f8f0",
-            font=("TkDefaultFont", 12, "bold"),
-        ).pack(side="left")
-        tk.Label(
-            row_total, text=format_price(pagar_cris),
-            foreground="#27ae60", background="#e8f8f0",
-            font=("TkDefaultFont", 12, "bold", "underline"),
-        ).pack(side="right")
-
-        # Guardar para _render_ganancia
-        self._last_costo_unitario = costo_pack
-        self._last_andres_pago_unitario = None  # No hay Andrés
-        self._last_pago_per_unit = None
-        self._last_cobro_per_unit = None
-        self._last_pack_mult = mult
-
     def _render_andres(self, info: dict | None):
         """Ganancia que se queda Andrés: cobra − paga, con desglose paso a
         paso (individual → pack → total venta), reusando los valores per-
@@ -2751,10 +2646,6 @@ class VentasApp:
         cobro_u = self._last_cobro_per_unit
         mult = self._last_pack_mult or 1
         if pago_u is None or cobro_u is None:
-            # Productos Cris no tienen sección Andrés — no mostrar nada.
-            sku = (info or {}).get("sku") if info else None
-            if sku and local_store.has_costo_ars(sku):
-                return
             ttk.Label(
                 frame,
                 text="(faltan datos para calcular)",
@@ -3102,29 +2993,8 @@ class VentasApp:
         combo_total_lbl.pack(anchor="e", pady=(4, 0))
         _update_combo_total()
 
-        # ── Solapa Cris (ARS) ──
-        tab_cris = ttk.Frame(notebook, padding=10)
-        notebook.add(tab_cris, text="Cris (ARS)")
-
-        ttk.Label(tab_cris, text="Costo unitario en pesos (lo que cobra Cris):").pack(anchor="w")
-        actual_cris = local_store.get_costo_ars(sku)
-        cris_var = tk.StringVar(value=f"{actual_cris:.2f}" if actual_cris else "")
-        entry_cris = ttk.Entry(tab_cris, textvariable=cris_var, width=20)
-        entry_cris.pack(anchor="w", pady=(2, 12))
-
-        ttk.Label(
-            tab_cris,
-            text="Precio directo en ARS, sin FOB, sin dólar.\nDejar vacío o 0 para borrar.",
-            foreground="#888",
-            font=("TkDefaultFont", 9, "italic"),
-        ).pack(anchor="w", pady=(0, 4))
-
         # Seleccionar la solapa correcta
-        if local_store.has_costo_ars(sku):
-            notebook.select(tab_cris)
-            entry_cris.focus_set()
-            entry_cris.select_range(0, "end")
-        elif local_store.is_combo(sku):
+        if local_store.is_combo(sku):
             notebook.select(tab_combo)
         else:
             notebook.select(tab_individual)
@@ -3163,7 +3033,7 @@ class VentasApp:
                         "Error", f"No se pudo guardar el FOB:\n{e}", parent=win
                     )
                     return
-            elif selected_tab == 1:
+            else:
                 # Combo
                 items = []
                 for r in combo_rows:
@@ -3192,27 +3062,6 @@ class VentasApp:
                 except Exception as e:
                     messagebox.showerror(
                         "Error", f"No se pudo guardar el combo:\n{e}", parent=win
-                    )
-                    return
-            else:
-                # Cris (ARS)
-                raw = cris_var.get().strip().replace(",", ".")
-                if raw == "":
-                    new_cris = 0.0
-                else:
-                    try:
-                        new_cris = float(raw)
-                    except ValueError:
-                        self._flash_status("Valor inválido — debe ser un número")
-                        return
-                    if new_cris < 0:
-                        self._flash_status("El precio no puede ser negativo")
-                        return
-                try:
-                    local_store.set_costo_ars(sku, new_cris if new_cris > 0 else None)
-                except Exception as e:
-                    messagebox.showerror(
-                        "Error", f"No se pudo guardar el costo ARS:\n{e}", parent=win
                     )
                     return
             self._on_fob_saved(win, sku)
@@ -3246,9 +3095,9 @@ class VentasApp:
         if not sku:
             self._flash_status("Esta venta no tiene SKU — no se puede cargar multiplicador")
             return "break"
-        if local_store.get_fob(sku) is None and not local_store.has_costo_ars(sku):
+        if local_store.get_fob(sku) is None:
             self._flash_status(
-                "Cargá primero el precio (Ctrl+Click)"
+                "Cargá primero el precio FOB (Ctrl+Click)"
             )
             return "break"
         self._open_mult_modal(sku, info.get("title") or "")
@@ -3276,8 +3125,7 @@ class VentasApp:
         ttk.Label(frame, text="Multiplicador (unidades por publicación):").pack(
             anchor="w"
         )
-        is_cris = local_store.has_costo_ars(sku)
-        actual = local_store.get_costo_ars_mult(sku) if is_cris else local_store.get_multiplicador(sku)
+        actual = local_store.get_multiplicador(sku)
         mult_var = tk.StringVar(value=str(actual) if actual else "")
         entry = ttk.Entry(frame, textvariable=mult_var, width=12)
         entry.pack(anchor="w", pady=(2, 12))
@@ -3310,10 +3158,7 @@ class VentasApp:
                 self._flash_status("El multiplicador debe ser ≥ 1")
                 return
             try:
-                if is_cris:
-                    local_store.set_costo_ars_mult(sku, new_mult)
-                else:
-                    local_store.set_multiplicador(sku, new_mult)
+                local_store.set_multiplicador(sku, new_mult)
             except Exception as e:
                 messagebox.showerror(
                     "Error", f"No se pudo guardar el multiplicador:\n{e}", parent=win
@@ -3627,13 +3472,11 @@ class VentasApp:
             quantity = 1
         bruto = float(info.get("total_amount") or 0)
 
-        costo_ars = local_store.get_costo_ars(sku) if sku else None
-        is_cris = costo_ars is not None
-        fob = None if is_cris else (local_store.get_fob(sku) if sku else None)
-        mult = (local_store.get_costo_ars_mult(sku) if is_cris else local_store.get_multiplicador(sku)) if sku else None
-        markup = GANANCIA_HERMANO_MULT
-        if not is_cris:
-            markup = local_store.get_markup(sku) or GANANCIA_HERMANO_MULT if sku else GANANCIA_HERMANO_MULT
+        fob = local_store.get_fob(sku) if sku else None
+        mult = local_store.get_multiplicador(sku) if sku else None
+        markup = local_store.get_markup(sku) if sku else None
+        if markup is None:
+            markup = GANANCIA_HERMANO_MULT
         cot = dolar.get()
         neto = local_store.get_neto_efectivo(order_id) if order_id else None
         neto_raw = local_store.get_neto_manual(order_id) if order_id else None
@@ -3649,22 +3492,8 @@ class VentasApp:
         lineas.append(f"💵 Precio publicado: *{format_price(bruto)}*")
         lineas.append("")
 
-        # ── Costo Cris (ARS directo) ──
-        if is_cris and costo_ars and mult:
-            costo_pack = costo_ars * mult
-            costo_total_cris = costo_pack * quantity
-            lineas.append("🏪 *COSTO PROVEEDOR CRIS (ARS)*")
-            lineas.append(f"• Costo unitario: {format_price(costo_ars)}")
-            if mult > 1:
-                lineas.append(f"• Por pack de {mult}: {format_price(costo_pack)}")
-            if quantity > 1:
-                lineas.append(f"• Total a pagar a Cris: *{format_price(costo_total_cris)}*")
-            else:
-                lineas.append(f"• A pagar a Cris: *{format_price(costo_total_cris)}*")
-            lineas.append("")
-
         # ── Costo de importación ──
-        if not is_cris and fob and mult and cot:
+        if fob and mult and cot:
             nac_unit = fob * NACIONALIZACION_MULT
             pesos_unit = nac_unit * cot
             andres_unit = pesos_unit * markup
@@ -3751,45 +3580,8 @@ class VentasApp:
         lineas.append("")
 
         # ── Ganancia total Pablo ──
-        if is_cris and costo_ars and mult and neto is not None:
-            costo_total_pablo = costo_ars * mult * quantity
-            ganancia_pablo = float(neto) - costo_total_pablo
-            margen_pct = (
-                (ganancia_pablo / bruto * 100) if bruto > 0 else 0
-            )
-            lineas.append("🎯 *RESULTADO FINAL PABLO*")
-            lineas.append(
-                f"• Le entró (neto efectivo): {format_price(neto)}"
-            )
-            lineas.append(
-                f"• Le pagó a Cris: -{format_price(costo_total_pablo)}"
-            )
-            signo = "✅" if ganancia_pablo >= 0 else "❌"
-            lineas.append(
-                f"• {signo} *Ganancia neta: {format_price(ganancia_pablo)}*"
-            )
-            lineas.append(
-                f"• Margen sobre el bruto: *{margen_pct:.1f}%*"
-            )
-
-            def nivel(pct):
-                if pct < 10:
-                    return "🔴 MUY BAJO"
-                if pct < 20:
-                    return "🟠 BAJO"
-                if pct < 30:
-                    return "🟢 BUENO"
-                return "🟣 EXCELENTE"
-
-            lineas.append(
-                f"• Nivel: {nivel(margen_pct)}"
-            )
-            lineas.append("")
-            lineas.append(
-                "_Niveles: <10% MUY BAJO · 10-20% BAJO · 20-30% BUENO · >30% EXCELENTE_"
-            )
-        elif (
-            not is_cris and fob and mult and cot and neto is not None
+        if (
+            fob and mult and cot and neto is not None
         ):
             costo_unit_pack = pesos_unit * mult * markup  # what Pablo paga a Andrés (per pack)
             costo_total_pablo = costo_unit_pack * quantity
@@ -3856,13 +3648,11 @@ class VentasApp:
         except (TypeError, ValueError):
             quantity = 1
 
-        costo_ars = local_store.get_costo_ars(sku) if sku else None
-        is_cris = costo_ars is not None
-        fob = None if is_cris else (local_store.get_fob(sku) if sku else None)
-        mult = (local_store.get_costo_ars_mult(sku) if is_cris else local_store.get_multiplicador(sku)) if sku else None
-        markup = GANANCIA_HERMANO_MULT
-        if not is_cris and sku:
-            markup = local_store.get_markup(sku) or GANANCIA_HERMANO_MULT
+        fob = local_store.get_fob(sku) if sku else None
+        mult = local_store.get_multiplicador(sku) if sku else None
+        markup = local_store.get_markup(sku) if sku else None
+        if markup is None:
+            markup = GANANCIA_HERMANO_MULT
         cot = dolar.get()
         neto = local_store.get_neto_efectivo(order_id) if order_id else None
 
@@ -3873,16 +3663,7 @@ class VentasApp:
         lineas.append(f"🛒 Cantidad vendida: *{quantity} {unidad_label}*")
         lineas.append("")
 
-        if is_cris and costo_ars and mult:
-            costo_total_cris = costo_ars * mult * quantity
-            lineas.append(f"🏪 *Costo Cris:* {format_price(costo_total_cris)}")
-            if neto is not None:
-                gan_pablo = float(neto) - costo_total_cris
-                signo = "✅" if gan_pablo >= 0 else "❌"
-                lineas.append(f"{signo} *Ganancia Pablo:* {format_price(gan_pablo)}")
-            else:
-                lineas.append("⚠️ *Ganancia Pablo:* falta cargar neto MP")
-        elif not is_cris and fob and mult and cot:
+        if fob and mult and cot:
             pesos_unit = fob * NACIONALIZACION_MULT * cot
             andres_total = pesos_unit * markup * mult * quantity
             pesos_total = pesos_unit * mult * quantity
@@ -3896,7 +3677,7 @@ class VentasApp:
             else:
                 lineas.append("⚠️ *Ganancia Pablo:* falta cargar neto MP")
         else:
-            lineas.append("⚠️ Faltan datos para calcular ganancias")
+            lineas.append("⚠️ Faltan datos (FOB / multiplicador / dólar) para calcular ganancias")
 
         texto = "\n".join(lineas)
         self._set_clipboard(texto)
@@ -4277,20 +4058,6 @@ class VentasApp:
             if not sku:
                 sin_costo.append(("", title, "sin SKU"))
                 continue
-
-            # ── Producto Cris (costo directo ARS) ──
-            costo_ars = local_store.get_costo_ars(sku)
-            if costo_ars is not None:
-                mult_cris = local_store.get_costo_ars_mult(sku)
-                if mult_cris is None:
-                    sin_costo.append((sku, title, "sin multiplicador"))
-                    continue
-                costo += costo_ars * mult_cris * quantity
-                neto_calc += neto_manual
-                count_calc += 1
-                continue
-
-            # ── Producto Andrés (FOB USD) ──
             fob = local_store.get_fob(sku)
             if not fob or fob <= 0:
                 sin_costo.append((sku, title, "sin FOB"))
