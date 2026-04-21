@@ -350,6 +350,11 @@ class VentasApp:
         self.tree.tag_configure("breakdown", background="#f8f8f8")
         self.tree.tag_configure("breakdown_bad", background="#f8f8f8", foreground="#c0392b")
         self.tree.tag_configure("breakdown_highlight", background="#f8f8f8", foreground="#1e7a1e")
+        _fb = ("TkDefaultFont", 11, "bold")
+        self.tree.tag_configure("breakdown_focused", background="#e8edf2", font=_fb)
+        self.tree.tag_configure("breakdown_bad_focused", background="#e8edf2", foreground="#c0392b", font=_fb)
+        self.tree.tag_configure("breakdown_highlight_focused", background="#e8edf2", foreground="#1e7a1e", font=_fb)
+        self._focused_row: str | None = None
         self._breakdown_rows: dict[str, list[str]] = {}
         self._breakdown_row_set: set[str] = set()
         self._breakdown_action: dict[str, tuple] = {}  # row_id -> ("action", ...args)
@@ -4884,6 +4889,26 @@ class VentasApp:
             self.context_menu.unpost()
         except tk.TclError:
             pass
+        row = self.tree.identify_row(event.y)
+        if row and row in self._breakdown_row_set:
+            prev = self._focused_row
+            if prev and prev != row:
+                try:
+                    old_tags = self.tree.item(prev, "tags")
+                    self.tree.item(prev, tags=tuple(t.replace("_focused", "") for t in old_tags))
+                except tk.TclError:
+                    pass
+            if row != prev:
+                cur_tags = self.tree.item(row, "tags")
+                self.tree.item(row, tags=tuple(t + "_focused" for t in cur_tags if not t.endswith("_focused")))
+                self._focused_row = row
+        elif self._focused_row:
+            try:
+                old_tags = self.tree.item(self._focused_row, "tags")
+                self.tree.item(self._focused_row, tags=tuple(t.replace("_focused", "") for t in old_tags))
+            except tk.TclError:
+                pass
+            self._focused_row = None
 
     def refresh(self):
         if self.loading:
