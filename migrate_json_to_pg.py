@@ -11,12 +11,6 @@ def migrate():
     data = json.loads(DATA_PATH.read_text(encoding="utf-8"))
     local_store.init()
 
-    # Checks
-    checks = data.get("checks") or []
-    for oid in checks:
-        local_store.set_check(oid, True)
-    print(f"  checks: {len(checks)}")
-
     # Notas
     notas = data.get("notas") or {}
     for oid, nota in notas.items():

@@ -21,7 +21,6 @@ _conn = None
 _loaded = False
 
 # ── Cache en memoria (se carga en init()) ──
-_checks_set: set[str] = set()
 _notas: dict[str, str] = {}
 _fob: dict[str, dict] = {}          # {sku: {precio, mult, markup}}
 _fob_combo: dict[str, dict] = {}    # {sku: {items: [...], mult, markup}}
@@ -72,15 +71,11 @@ def _q(sql, params=None, fetch=None):
 
 def init() -> None:
     """Carga todo desde PostgreSQL a memoria."""
-    global _loaded, _checks_set, _notas, _fob, _fob_combo, _costo_ars
+    global _loaded, _notas, _fob, _fob_combo, _costo_ars
     global _etiquetas_cat, _etiquetas_sku, _neto_manual, _shipping_manual
     global _consolidados, _liquidacion_links
 
     _get_conn()
-
-    # Checks
-    rows = _q("SELECT order_id FROM checks", fetch="all") or []
-    _checks_set = {r[0] for r in rows}
 
     # Notas
     rows = _q("SELECT order_id, nota FROM notas", fetch="all") or []
@@ -161,36 +156,6 @@ def init() -> None:
 
 def loaded() -> bool:
     return _loaded
-
-
-# ────────────────────── Checks ──────────────────────
-
-def is_checked(order_id: str) -> bool:
-    return order_id in _checks_set
-
-
-def all_checked() -> set[str]:
-    return set(_checks_set)
-
-
-def count_checked() -> int:
-    return len(_checks_set)
-
-
-def set_check(order_id: str, checked: bool) -> None:
-    if not order_id:
-        return
-    if checked:
-        if order_id in _checks_set:
-            return
-        _checks_set.add(order_id)
-        _q("INSERT INTO checks (order_id) VALUES (%s) ON CONFLICT DO NOTHING",
-           (order_id,))
-    else:
-        if order_id not in _checks_set:
-            return
-        _checks_set.discard(order_id)
-        _q("DELETE FROM checks WHERE order_id = %s", (order_id,))
 
 
 # ────────────────────── FOB / multiplicador ──────────────────────
