@@ -1,8 +1,6 @@
 # ventas-ml
 
-App Tkinter que lista las ventas de MercadoLibre (PaliShopping, USER_ID 24192412) en vivo, agrupadas por día, con costeo de importación, neto MP heurístico, notas libres por venta, etiquetas locales por SKU, y un modal de "Frase del día" que llama a Anthropic API. Uso interno del vendedor.
-
-**App 100% local**: la única red que se hace al cargar es a `/orders/search` de ML. Todo lo demás (checks, notas, FOBs, etiquetas) vive en `data.json` al lado del proyecto.
+App Tkinter que lista las ventas de MercadoLibre (PaliShopping, USER_ID 24192412) en vivo, agrupadas por día, con costeo de importación, neto MP manual, notas libres por venta, etiquetas locales por SKU, y un modal de "Frase del día" que llama a Anthropic API. Uso interno del vendedor.
 
 ## Dependencias externas
 
@@ -13,23 +11,44 @@ App Tkinter que lista las ventas de MercadoLibre (PaliShopping, USER_ID 24192412
 - **whatsapp-mcp en `localhost:3100`** — solo Fedora. En WSL el botón "Mandar a Pablo" del modal de Frase falla (esperado).
 - **Fuentes Fedora** en `/usr/share/fonts/` (LiberationMono-Bold + Symbola) — el modal de Frase rinde con PIL porque Tk-Linux no muestra emojis.
 
-## Persistencia: `local_store.py` + `data.json`
+## Persistencia: `local_store.py` + PostgreSQL (Hetzner VPS)
 
-Toda la persistencia está en un único JSON al lado del proyecto. No hay Turso, no hay base remota, no hay write-through async — escribir el JSON entero es instantáneo a esta escala. `local_store` expone API sync para checks, FOBs, multiplicadores, notas, etiquetas y neto manual. Cada `set_*` reescribe el archivo de forma atómica (tmp + rename).
+La persistencia está en PostgreSQL remoto (VPS Hetzner) con cache en memoria. `local_store` expone API sync para FOBs, multiplicadores, notas, etiquetas, neto manual y envío. Cada `set_*` escribe a PostgreSQL y actualiza el cache en memoria.
 
-Estructura del JSON:
-```json
-{
-  "checks":             ["order_id1", ...],
-  "notas":              {"order_id": "texto"},
-  "fob":                {"SKU": {"precio": 12.5, "mult": 1}},
-  "etiquetas_catalogo": ["ordenador", "blanco", ...],
-  "etiquetas_por_sku":  {"SKU": ["ordenador", ...]},
-  "neto_manual":        {"order_id": 12345.67}
-}
+`data.json` es un legado de la migración — ya no es la fuente de verdad pero sigue en el repo como backup.
+
+## UI: Treeview nativo con breakdown expandible
+
+La UI principal es un **treeview nativo de Tkinter** usando solo la columna `#0`. No hay panel de detalle lateral. No hay columnas visibles de datos.
+
+### Estructura del tree
+
+1. **Nodos día** (raíz) — `21/04/2026  —  2 ventas  —  $97,120.00`, arrancan abiertos
+2. **Nodos venta** (hijos del día) — texto inline: `2x  Organizador De Remeras...  ·  SKU-ABC  ·  $60,000.00`
+3. **Breakdown** (hijos de la venta) — desglose financiero cerrado por default:
+   - **Cobro Mercado Pago**: bruto, neto MP, envío Flex, neto efectivo, método
+   - **Costo importación**: FOB/costo ARS, multiplicador, nacionalización, markup Andrés
+   - **Ganancia**: ganancia Pablo, margen %
+
+### Edición por doble click en breakdown
+
+Cada fila editable del breakdown tiene una acción asociada en `_breakdown_action`. Doble click abre el modal correspondiente:
+- Neto MP → modal neto
+- Envío (Flex) → modal envío
+- FOB / costo unitario → modal FOB
+- Multiplicador → modal multiplicador
+- Markup Andrés → modal markup
+- Sin SKU → modal editar SKU
+
+### Tracking de breakdown rows
+
+```python
+_breakdown_rows: dict[str, list[str]]   # leaf_id -> [row_ids del breakdown]
+_breakdown_row_set: set[str]            # lookup rápido para saber si un row es breakdown
+_breakdown_action: dict[str, tuple]     # row_id -> ("accion", ...args) para doble click
 ```
 
-**`data.json` SÍ va al repo** — Pablo carga FOBs, multiplicadores, etiquetas y netos a mano y los necesita en cualquier máquina donde corra la app. Que los checks y notas vivan ahí también es un efecto colateral asumido (mismo archivo).
+Al refrescar un breakdown (tras editar un dato), se preserva el estado open/closed del nodo padre. Las 3 estructuras se limpian en `refresh()`.
 
 ## Atajos de teclado y mouse
 
@@ -37,15 +56,19 @@ Sobre la fila seleccionada del Treeview:
 
 | Tecla / mouse        | Acción                                              |
 |----------------------|-----------------------------------------------------|
-| Doble click          | Modal "Editar SKU" (PUT a ML)                       |
+| Doble click          | En breakdown: abre modal del dato clickeado          |
 | Ctrl + click         | Modal "Editar precio FOB"                           |
 | Alt + click          | Modal "Editar multiplicador"                        |
-| Click derecho        | Menú contextual (copiar SKU/título/ID, refrescar)   |
+| Click derecho        | Menú contextual (copiar, editar SKU, neto, envío)   |
+| E                    | Expandir nodo (recursivo)                           |
+| C                    | Colapsar nodo y sus hijos                           |
 | F1                   | Detalle de la venta en ML (`/ventas/{id}/detalle`)  |
 | F2                   | Cobro en Mercado Pago (`activities?q={payment_id}`) |
 | F3                   | Editor de la publicación (`/publicaciones/{id}/modificar`) |
 | F4                   | Publicación pública (`articulo.mercadolibre.com.ar`) |
 | F6                   | Abre las cuatro de F1-F4 en pestañas separadas      |
+
+Botones en la toolbar: **Expandir todo** / **Colapsar todo** (todos los nodos del tree).
 
 Los handlers de F-keys están centralizados en una sección con `_selected_leaf_data()` (devuelve `(leaf_id, info, order_id)` validados) + URL builders chiquitos (`_open_detalle_venta`, `_open_pago_mp`, `_open_publi_edit`, `_open_publi_publica`). F6 reusa los builders sin duplicar la validación. Si tocás los URLs, tocá el builder, no los handlers.
 
@@ -53,7 +76,17 @@ Los handlers de F-keys están centralizados en una sección con `_selected_leaf_
 
 ### Tupla `values` del Treeview
 
-`values = (check, fecha, sku, cant, producto, precio, subtotal)`. Cuando muevas o agregues columnas, **grep obligatorio de `values\[` y `values =`** antes de cerrar el cambio. Preferí siempre unpacking sobre acceso por índice — falla loud si cambia la forma.
+`values = (fecha, sku, cant, producto, precio, subtotal)`. Cuando muevas o agregues columnas, **grep obligatorio de `values\[` y `values =`** antes de cerrar el cambio. Preferí siempre unpacking sobre acceso por índice — falla loud si cambia la forma.
+
+El `text` del nodo (column #0) es el display inline y se construye aparte. Si cambiás el format del `display_text`, grep `display_text` para encontrar todos los lugares donde se arma (insert y refresh de SKU).
+
+### Guards en breakdown rows
+
+Los breakdown rows NO son seleccionables, NO disparan acciones de items, y NO entran en iteraciones de ventas:
+- `_on_select`: si la selección es breakdown, `selection_remove`
+- `_on_right_click`: si es breakdown, redirige a `tree.parent(row)`
+- `_on_click`: no hace toggle (checks eliminados)
+- Iteraciones de totales/export: usan `row_to_order` que solo tiene leaves reales
 
 ### `leaf_to_item` vs `row_to_order` vs `_all_leaves()`
 
@@ -65,27 +98,21 @@ El mini totalizador y `_calcular_totales_seleccionados` iteran `row_to_order` a 
 
 ### Neto MP — manual por venta
 
-**El neto NO se calcula desde la API.** Antes había heurísticos (sale_fee, taxes, shipping, etc.) que se restaban del total y daban un neto aproximado. Eso se eliminó completamente. Ahora Pablo va al detalle de la venta en Mercado Pago, copia el neto real, y lo pega en el modal "✏️ Cargar / editar neto MP" del panel de detalle. Se persiste por `order_id` en `local_store.neto_manual`.
+**El neto NO se calcula desde la API.** Pablo va al detalle de la venta en Mercado Pago, copia el neto real, y lo carga via doble click en la fila "Neto MP" del breakdown (o click derecho → "Cargar neto MP"). Se persiste por `order_id` en `local_store.neto_manual`.
 
-Cualquier cálculo que dependa del neto (`_render_ganancia`, `_render_payment`, `_calcular_totales_seleccionados`) lee de `local_store.get_neto_manual(order_id)`. Si no está cargado, la UI muestra "⚠️ Falta neto MP" y la venta no entra en el cómputo de ganancia/totales.
-
-Bruto sí se sigue mostrando porque viene gratis del listado de orders (`order.total_amount`) y no es un cálculo.
+Si no está cargado, el breakdown muestra "Neto MP: no cargado" en rojo y la venta no entra en el cómputo de ganancia/totales.
 
 ### SKU viene tal cual de la API
 
-Antes había un `_refresh_skus_batch` que después de cargar las órdenes pegaba a `/items?ids=...` para "refrescar" el SKU porque el del listado de orders puede ser snapshot histórico. Eso se eliminó completamente. **El SKU es el que viene en `order_items[].item.seller_sku` (o `seller_custom_field` o `variation_attributes[SELLER_SKU]`) y no se toca.** Si está desactualizado, se edita a mano por doble click.
+**El SKU es el que viene en `order_items[].item.seller_sku` (o `seller_custom_field` o `variation_attributes[SELLER_SKU]`) y no se toca.** Si está desactualizado, se edita via click derecho → "Editar SKU".
 
 ### URL de Mercado Pago — buscar por payment_id, NO order_id
 
-`Alt+click` abre `mercadopago.com.ar/activities?q={payment_id}`. MP busca por su ID nativo, no por el de ML. No "limpiar" volviendo al order_id.
+F2 abre `mercadopago.com.ar/activities?q={payment_id}`. MP busca por su ID nativo, no por el de ML. No "limpiar" volviendo al order_id.
 
 ### Helpers de WSL (`_IS_WSL`, `_set_clipboard`, `_open_url`)
 
 La app corre en Fedora y en WSL/Win10. En WSL, Tk no escribe al clipboard de Windows (hay que usar `clip.exe`) y `webbrowser.open` no abre nada (hay que usar `cmd.exe /c start`). Si los "limpiás" por parecer redundantes, rompés WSL silenciosamente.
-
-### Etiquetas con dropdown, no texto libre
-
-Las etiquetas se asignan a SKUs desde un combobox alimentado por un catálogo. El catálogo se llena con el botón `+` al lado del combo. Es deliberado: si fuera texto libre se ensucia con variantes ("blanco" / "Blanco" / "blanc"). Para borrar una etiqueta de un SKU, click en el `✕` rojo del chip. Para borrar una etiqueta del catálogo entero, no hay UI todavía — editar `data.json` o agregar `local_store.remove_etiqueta_catalogo`.
 
 ### Constantes comerciales hardcodeadas
 
