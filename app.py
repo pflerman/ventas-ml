@@ -326,6 +326,10 @@ class VentasApp:
             label="Copiar selección (WhatsApp)",
             command=self._copy_selected_to_clipboard,
         )
+        self.context_menu.add_command(
+            label="Copiar a Sheets",
+            command=self._copy_to_sheets,
+        )
         self.context_menu.add_separator()
         self.context_menu.add_command(
             label="✏️ Editar SKU", command=self._ctx_editar_sku
@@ -4168,6 +4172,7 @@ class VentasApp:
         self.context_menu.entryconfig("Copiar título", state=leaf_state)
         self.context_menu.entryconfig("Copiar SKU", state=leaf_state)
         self.context_menu.entryconfig("Copiar ID publicación", state=leaf_state)
+        self.context_menu.entryconfig("Copiar a Sheets", state=leaf_state)
         self.context_menu.entryconfig("✏️ Editar SKU", state=leaf_state)
         self.context_menu.entryconfig("✏️ Cargar neto MP", state=leaf_state)
         self.context_menu.entryconfig("🚚 Cargar envío", state=leaf_state)
@@ -4566,6 +4571,35 @@ class VentasApp:
         title = values[3]
         self._set_clipboard(title)
         self._flash_status("Título copiado ✓")
+
+    def _copy_to_sheets(self):
+        row = self._right_clicked_row
+        if not row or self.tree.parent(row) == "":
+            return
+        info = self.leaf_to_item.get(row) or {}
+        order_id = self.row_to_order.get(row) or ""
+        meta = self._leaves_meta.get(row) or {}
+        fecha = meta.get("day_key", "")
+        quantity = int(info.get("quantity") or 1)
+        title = info.get("title") or ""
+        sku = info.get("sku") or ""
+        cot = dolar.get()
+        importe = ""
+        costo_ars = local_store.get_costo_ars(sku) if sku else None
+        if costo_ars is not None:
+            mult_cris = local_store.get_costo_ars_mult(sku)
+            if mult_cris is not None:
+                importe = f"{costo_ars * mult_cris * quantity:.2f}".replace(".", ",")
+        elif sku and cot:
+            fob = local_store.get_fob(sku)
+            mult = local_store.get_multiplicador(sku)
+            if fob and fob > 0 and mult is not None:
+                markup = local_store.get_markup(sku) or GANANCIA_HERMANO_MULT
+                total = fob * mult * NACIONALIZACION_MULT * cot * markup * quantity
+                importe = f"{total:.2f}".replace(".", ",")
+        line = f"{fecha}\t{quantity}\t{title}\t{importe}"
+        self._set_clipboard(line)
+        self._flash_status("Copiado para Sheets ✓")
 
     def _open_url(self, url: str):
         """Abre una URL en el browser y trata de levantarlo al frente.
