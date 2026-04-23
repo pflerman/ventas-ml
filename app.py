@@ -3055,6 +3055,11 @@ class VentasApp:
 
     def _on_fob_saved(self, win, sku: str):
         win.destroy()
+        if local_store.has_costo_ars(sku):
+            if local_store.get_costo_ars_mult(sku) is None:
+                local_store.set_costo_ars_mult(sku, 1.0)
+        elif local_store.get_fob(sku) and local_store.get_multiplicador(sku) is None:
+            local_store.set_multiplicador(sku, 1.0)
         self._flash_status(f"FOB guardado para {sku} ✓")
         self._refresh_breakdowns_by_sku(sku)
 
