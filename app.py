@@ -286,6 +286,7 @@ class VentasApp:
         self.tree.bind("<Alt-Button-1>", self._on_alt_click_mult)
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
         self.tree.bind("<Double-Button-1>", self._on_double_click)
+        self.tree.bind("<Button-2>", self._on_middle_click)
         self.tree.bind("<e>", self._key_expand_node)
         self.tree.bind("<c>", self._key_collapse_node)
 
@@ -1477,9 +1478,13 @@ class VentasApp:
         if not info or not order_id:
             return
         was_open = self.tree.item(leaf_id, "open")
+        open_labels: set[str] = set()
         if leaf_id in self._breakdown_rows:
             for row_id in self._breakdown_rows[leaf_id]:
                 try:
+                    if self.tree.item(row_id, "open"):
+                        label = self.tree.item(row_id, "text").split(":")[0]
+                        open_labels.add(label)
                     self.tree.delete(row_id)
                 except tk.TclError:
                     pass
@@ -1487,6 +1492,14 @@ class VentasApp:
                 self._breakdown_action.pop(row_id, None)
             del self._breakdown_rows[leaf_id]
         self._insert_breakdown(leaf_id, info, order_id)
+        if open_labels and leaf_id in self._breakdown_rows:
+            for row_id in self._breakdown_rows[leaf_id]:
+                try:
+                    label = self.tree.item(row_id, "text").split(":")[0]
+                    if label in open_labels:
+                        self.tree.item(row_id, open=True)
+                except tk.TclError:
+                    pass
         self.tree.item(leaf_id, open=was_open)
 
     def _render_payment(self, info: dict | None):
@@ -4184,6 +4197,15 @@ class VentasApp:
         self.context_menu.tk_popup(event.x_root, event.y_root)
         self.context_menu.focus_set()
 
+    def _on_middle_click(self, event):
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        action = self._breakdown_action.get(row)
+        if action and action[0] == "neto":
+            self._open_envio_modal(action[1])
+            return "break"
+
     def _on_double_click(self, event):
         row = self.tree.identify_row(event.y)
         if not row:
@@ -5095,7 +5117,7 @@ class VentasApp:
             text=day_key,
             values=("", "", "", "", ""),
             tags=("day",),
-            open=True,
+            open=False,
         )
         self.day_nodes[day_key] = parent_id
         return parent_id
