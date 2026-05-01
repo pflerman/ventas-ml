@@ -4974,6 +4974,7 @@ class VentasApp:
     def refresh(self):
         if self.loading:
             return
+        local_store.init()
         self.tree.delete(*self.tree.get_children())
         self.row_to_order.clear()
         self.row_base.clear()
