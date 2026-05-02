@@ -28,15 +28,25 @@ _TZ_AR = timezone(timedelta(hours=-3))
 mcp = FastMCP("ventas-ml")
 
 
+def _parse_ar(iso: str):
+    if not iso:
+        return None
+    return datetime.fromisoformat(iso.replace("Z", "+00:00")).astimezone(_TZ_AR)
+
+
 def _fetch_orders_by_date(auth: MLAuth, fecha_desde: str, fecha_hasta: str) -> list[dict]:
+    desde_date = datetime.strptime(fecha_desde, "%Y-%m-%d").date()
+    hasta_date = datetime.strptime(fecha_hasta, "%Y-%m-%d").date()
+    query_desde = (desde_date - timedelta(days=1)).isoformat()
+    query_hasta = (hasta_date + timedelta(days=1)).isoformat()
     all_results = []
     offset = 0
     while True:
         params = {
             "seller": USER_ID,
             "sort": "date_desc",
-            "order.date_created.from": f"{fecha_desde}T00:00:00.000-03:00",
-            "order.date_created.to": f"{fecha_hasta}T23:59:59.999-03:00",
+            "order.date_created.from": f"{query_desde}T00:00:00.000-03:00",
+            "order.date_created.to": f"{query_hasta}T23:59:59.999-03:00",
             "offset": offset,
             "limit": 50,
         }
@@ -50,7 +60,12 @@ def _fetch_orders_by_date(auth: MLAuth, fecha_desde: str, fecha_hasta: str) -> l
         offset += len(results)
         if offset >= total or not results:
             break
-    return all_results
+    filtered = []
+    for order in all_results:
+        dt = _parse_ar(order.get("date_created", ""))
+        if dt and desde_date <= dt.date() <= hasta_date:
+            filtered.append(order)
+    return filtered
 
 
 def _extract_sku(order_item: dict) -> str:
@@ -94,12 +109,8 @@ def ventas_por_fecha(fecha_desde: str, fecha_hasta: str = "") -> str:
 
     by_day: dict[str, list[dict]] = defaultdict(list)
     for order in orders:
-        dt_str = order.get("date_created", "")
-        if dt_str:
-            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).astimezone(_TZ_AR)
-            day_key = dt.strftime("%Y-%m-%d")
-        else:
-            day_key = "sin-fecha"
+        dt = _parse_ar(order.get("date_created", ""))
+        day_key = dt.strftime("%Y-%m-%d") if dt else "sin-fecha"
         items = order.get("order_items") or []
         first = items[0] if items else {}
         item_data = first.get("item") or {}
@@ -663,12 +674,8 @@ def procesar_dia(fecha: str) -> str:
         sku = _extract_sku(first)
         title = item.get("title", "(sin título)")
         quantity = int(first.get("quantity") or 1)
-        dt_str = order.get("date_created", "")
-        if dt_str:
-            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).astimezone(_TZ_AR)
-            fecha_fmt = dt.strftime("%d/%m/%Y")
-        else:
-            fecha_fmt = ""
+        dt = _parse_ar(order.get("date_created", ""))
+        fecha_fmt = dt.strftime("%d/%m/%Y") if dt else ""
         costo, _ = _costo_para_pagar(sku, quantity, cot)
         if costo is None:
             sheet_err.append(f"  {quantity}x  {title}  ·  {sku}  →  sin costo calculable")
@@ -846,12 +853,8 @@ def cargar_ventas_sheet(fecha_desde: str, fecha_hasta: str = "") -> str:
         sku = _extract_sku(first)
         title = item.get("title", "(sin título)")
         quantity = int(first.get("quantity") or 1)
-        dt_str = order.get("date_created", "")
-        if dt_str:
-            dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00")).astimezone(_TZ_AR)
-            fecha = dt.strftime("%d/%m/%Y")
-        else:
-            fecha = ""
+        dt = _parse_ar(order.get("date_created", ""))
+        fecha = dt.strftime("%d/%m/%Y") if dt else ""
 
         costo, proveedor = _costo_para_pagar(sku, quantity, cot)
         if costo is None:
